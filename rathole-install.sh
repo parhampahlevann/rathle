@@ -1,192 +1,225 @@
-#!/bin/bash
-# ============================================
-# Rathole Installer - No Process Substitution
-# Version: 5.1-fixed
-# ============================================
+#!/usr/bin/env bash
+# rathole-manager-en.sh
+# Combined auto-diagnose, optional install, tunnel-config creation, and systemd service creation.
+# Usage:
+#   Interactive: sudo ./rathole-manager-en.sh
+#   Diagnose only: ./rathole-manager-en.sh [VERSION]
+#   Diagnose + install: sudo ./rathole-manager-en.sh [VERSION] --install
 
-set -e
+set -euo pipefail
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+# -----------------------
+# Configuration defaults
+# -----------------------
+VERSION_DEFAULT="0.5.0"
+VERSION="${1:-$VERSION_DEFAULT}"
+INSTALL_FLAG="no"
+if [[ "${2:-}" == "--install" || "${3:-}" == "--install" ]]; then
+  INSTALL_FLAG="yes"
+fi
 
-# Main Configuration
-RATHOLE_VERSION="0.5.0"
 CONFIG_DIR="/root/rathole-core"
 INSTALL_DIR="/usr/local/bin"
 
-# Banner
-show_banner() {
-    clear
-    echo -e "${CYAN}"
-    echo "╔══════════════════════════════════════════╗"
-    echo "║     Rathole Installer - Simple v5.1      ║"
-    echo "╚══════════════════════════════════════════╝"
-    echo -e "${NC}"
-    echo -e "${YELLOW}Simple installation without complex commands${NC}"
-    echo -e "${BLUE}==============================================${NC}"
+# -----------------------
+# Colors / helpers
+# -----------------------
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+info(){ printf "%b%s%b\n" "$CYAN" "$1" "$NC"; }
+ok(){ printf "%b%s%b\n" "$GREEN" "$1" "$NC"; }
+warn(){ printf "%b%s%b\n" "$YELLOW" "$1" "$NC"; }
+err(){ printf "%b%s%b\n" "$RED" "$1" "$NC"; }
+ech(){ printf "%b\n" "$1"; }
+
+# -----------------------
+# Utility functions
+# -----------------------
+check_root_or_warn() {
+  if [[ $EUID -ne 0 ]]; then
+    warn "You are not running as root. Some operations (install, write to /root or /usr/local/bin, systemd) require sudo/root."
+  fi
 }
 
-# Check root
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}[ERROR] Please run with sudo${NC}"
-        echo -e "${YELLOW}Usage: sudo bash ./rathole-install.sh${NC}"
-        exit 1
-    fi
+ensure_dirs() {
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+  mkdir -p "$INSTALL_DIR" 2>/dev/null || true
 }
 
-# Install dependencies
-install_deps() {
-    echo -e "${YELLOW}[*] Installing required tools...${NC}"
-    
-    # Fix apt locks (best-effort)
-    for lock in /var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/apt/lists/lock-frontend /var/lib/dpkg/lock-frontend; do
-        if [[ -e $lock ]]; then
-            rm -f $lock 2>/dev/null || true
-        fi
-    done
-    
-    # Update and install (best-effort)
-    apt-get update 2>/dev/null || true
-    
-    # Ensure these tools exist (including openssl)
-    for tool in curl wget tar openssl; do
-        if ! command -v $tool >/dev/null 2>&1; then
-            echo -e "${YELLOW}[-] Installing $tool...${NC}"
-            apt-get install -y $tool 2>/dev/null || {
-                echo -e "${RED}[WARN] Could not install $tool via apt-get. Please install it manually.${NC}"
-            }
-        fi
-    done
-    
-    echo -e "${GREEN}[✓] Tools ready (curl/wget/tar/openssl checked)${NC}"
+detect_sys_arch() {
+  local u
+  u="$(uname -m || true)"
+  case "$u" in
+    x86_64|amd64) echo "x86_64" ;;
+    aarch64|arm64) echo "aarch64" ;;
+    armv7l) echo "armv7" ;;
+    i386|i686) echo "i386" ;;
+    *) echo "$u" ;;
+  esac
 }
 
-# Download helper (tries wget then curl)
 download_file() {
-    local url="$1"
-    local out="$2"
-
-    if command -v wget >/dev/null 2>&1; then
-        wget -q "$url" -O "$out" && return 0
-    fi
-
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$url" -o "$out" && return 0
-    fi
-
-    return 1
+  local url="$1" out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 3 --max-time 60 -o "$out" "$url" && return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -q -O "$out" "$url" && return 0
+  fi
+  return 1
 }
 
-# Download and install Rathole
-install_rathole() {
-    echo -e "${GREEN}[*] Installing Rathole v${RATHOLE_VERSION}${NC}"
-    
-    # Clean old install
-    rm -rf "$CONFIG_DIR" 2>/dev/null || true
-    mkdir -p "$CONFIG_DIR"
+# -----------------------
+# Diagnose / Download / Extract / (optional) Install
+# -----------------------
+run_diagnose_and_optional_install() {
+  local ver="${1:-$VERSION}"
+  local install_mode="${2:-$INSTALL_FLAG}"
 
-    # Ensure INSTALL_DIR exists
-    mkdir -p "$INSTALL_DIR" 2>/dev/null || true
-    
-    # Detect architecture
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64|amd64) BIN_ARCH="x86_64" ;;
-        aarch64|arm64) BIN_ARCH="aarch64" ;;
-        armv7l) BIN_ARCH="armv7" ;;
-        *) BIN_ARCH="x86_64" ;;
-    esac
-    
-    echo -e "${YELLOW}[-] Architecture: $BIN_ARCH${NC}"
-    
-    # Primary and fallback URLs
-    URL_PRIMARY="https://github.com/rathole-org/rathole/releases/download/v${RATHOLE_VERSION}/rathole-${RATHOLE_VERSION}-${BIN_ARCH}-unknown-linux-gnu.tar.gz"
-    URL_FALLBACK="https://github.com/rathole-org/rathole/releases/download/v0.4.8/rathole-0.4.8-${BIN_ARCH}-unknown-linux-gnu.tar.gz"
+  local TMPDIR
+  TMPDIR="$(mktemp -d)"
+  trap 'rm -rf "$TMPDIR"' EXIT INT TERM
 
-    echo -e "${YELLOW}[-] Downloading from: $URL_PRIMARY${NC}"
-    
-    TEMP_DIR=$(mktemp -d)
-    # Ensure cleanup on exit
-    trap 'rm -rf "$TEMP_DIR"' EXIT INT TERM
+  local SYS_ARCH
+  SYS_ARCH="$(detect_sys_arch)"
 
-    cd "$TEMP_DIR" || { echo -e "${RED}[ERROR] Could not enter temp dir${NC}"; return 1; }
-    
-    # Try primary then fallback
-    if ! download_file "$URL_PRIMARY" rathole.tar.gz; then
-        echo -e "${RED}[!] Primary download failed, trying fallback...${NC}"
-        if ! download_file "$URL_FALLBACK" rathole.tar.gz; then
-            echo -e "${RED}[ERROR] All downloads failed. Check network or URL.${NC}"
-            return 1
-        fi
+  info "System detection: uname -> $(uname -m)  mapped to -> $SYS_ARCH"
+  info "Requested rathole version: $ver"
+  info "Working temp dir: $TMPDIR"
+
+  local URL_PRIMARY="https://github.com/rathole-org/rathole/releases/download/v${ver}/rathole-${ver}-${SYS_ARCH}-unknown-linux-gnu.tar.gz"
+  local URL_FALLBACK="https://github.com/rathole-org/rathole/releases/download/v0.4.8/rathole-0.4.8-${SYS_ARCH}-unknown-linux-gnu.tar.gz"
+
+  cd "$TMPDIR" || return 1
+  local ARCHIVE="rathole.tar.gz"
+
+  ok "Starting download..."
+  if ! download_file "$URL_PRIMARY" "$ARCHIVE"; then
+    warn "Primary download failed; trying fallback..."
+    if ! download_file "$URL_FALLBACK" "$ARCHIVE"; then
+      err "Both primary and fallback downloads failed. Check network or release availability."
+      ls -l "$TMPDIR" || true
+      return 2
     fi
-    
-    # Extract and install
-    if [[ -f "rathole.tar.gz" ]]; then
-        tar -xzf rathole.tar.gz 2>/dev/null || {
-            echo -e "${RED}[ERROR] Failed to extract archive${NC}"
-            return 1
-        }
-        
-        # Find binary (search deeper too)
-        BINARY=$(find . -type f -name "rathole" | head -n 1 || true)
-        
-        if [[ -n "$BINARY" && -f "$BINARY" ]]; then
-            # Copy into config dir and system dir using install for proper perms
-            install -Dm755 "$BINARY" "$CONFIG_DIR/rathole" || cp "$BINARY" "$CONFIG_DIR/rathole"
-            chmod +x "$CONFIG_DIR/rathole" || true
-            
-            # Also copy to /usr/local/bin for easy access (best-effort)
-            if install -Dm755 "$BINARY" "$INSTALL_DIR/rathole" 2>/dev/null; then
-                chmod +x "$INSTALL_DIR/rathole" 2>/dev/null || true
-            else
-                cp "$BINARY" "$INSTALL_DIR/rathole" 2>/dev/null || true
-            fi
-            
-            echo -e "${GREEN}[✓] Rathole installed successfully!${NC}"
-            echo -e "${YELLOW}Main binary: $CONFIG_DIR/rathole${NC}"
-            echo -e "${YELLOW}System binary: $INSTALL_DIR/rathole${NC}"
-        else
-            echo -e "${RED}[ERROR] Could not find rathole binary inside archive${NC}"
-            return 1
-        fi
+  fi
+
+  if [[ ! -s "$ARCHIVE" ]]; then
+    err "Downloaded archive is empty or missing."
+    return 3
+  fi
+  ok "Downloaded archive size: $(stat -c%s "$ARCHIVE") bytes"
+
+  # Check for HTML content (common if GitHub returned a 404 page)
+  if grep -I -m1 -E '<!DOCTYPE|<html|<title>' "$ARCHIVE" >/dev/null 2>&1; then
+    warn "Downloaded file contains HTML -> likely a 404/HTML error page instead of tar.gz."
+    echo "---- excerpt ----"
+    head -c 200 "$ARCHIVE" || true
+    echo
+    echo "---- end excerpt ----"
+    err "Aborting: archive appears to be HTML. Verify the release URL or network access."
+    return 4
+  fi
+
+  ech
+  ok "Archive contents (first 200 lines):"
+  tar -tzf "$ARCHIVE" | sed -n '1,200p' || { err "tar could not list archive."; return 5; }
+
+  local EXTRACT_DIR="$TMPDIR/extracted"
+  mkdir -p "$EXTRACT_DIR"
+  ok "Extracting archive..."
+  tar -xzf "$ARCHIVE" -C "$EXTRACT_DIR" || { err "Extraction failed."; return 6; }
+
+  find "$EXTRACT_DIR" -maxdepth 4 -ls || true
+
+  local BIN_PATH
+  BIN_PATH="$(find "$EXTRACT_DIR" -type f -iname 'rathole' -print -quit || true)"
+  if [[ -z "$BIN_PATH" ]]; then
+    err "No file named 'rathole' found inside the archive."
+    return 7
+  fi
+
+  ok "Candidate binary found: $BIN_PATH"
+  if command -v file >/dev/null 2>&1; then
+    file "$BIN_PATH" || true
+  fi
+  stat -c "%A %U %G %s bytes %n" "$BIN_PATH" || true
+
+  if [[ ! -x "$BIN_PATH" ]]; then
+    warn "Executable bit not set; attempting chmod +x..."
+    chmod +x "$BIN_PATH" || true
+  fi
+
+  if command -v ldd >/dev/null 2>&1; then
+    ech
+    warn "ldd output (may error for static or incompatible-arch binaries):"
+    ldd "$BIN_PATH" 2>&1 | sed -n '1,200p' || true
+  else
+    warn "ldd not available; cannot show linked libraries."
+  fi
+
+  ech
+  warn "Trying to run '--version' (best-effort):"
+  if "$BIN_PATH" --version >/dev/null 2>&1; then
+    ok "Binary ran with --version successfully:"
+    "$BIN_PATH" --version 2>&1 | sed -n '1,200p'
+  else
+    warn "Running --version failed or produced no output (can be normal if arch mismatch)."
+  fi
+
+  # Install if requested
+  if [[ "$install_mode" == "yes" ]]; then
+    if [[ $EUID -ne 0 ]]; then
+      err "Install requested but not running as root. Re-run with sudo."
+      return 8
+    fi
+
+    ensure_dirs
+
+    if install -Dm755 "$BIN_PATH" "$CONFIG_DIR/rathole"; then
+      ok "Installed to $CONFIG_DIR/rathole"
     else
-        echo -e "${RED}[ERROR] Download failed completely${NC}"
-        return 1
+      warn "install failed; trying cp..."
+      cp "$BIN_PATH" "$CONFIG_DIR/rathole" && chmod +x "$CONFIG_DIR/rathole" && ok "Copied to $CONFIG_DIR/rathole" || err "Failed to place binary in $CONFIG_DIR"
     fi
 
-    # Cleanup handled by trap
-    cd / || true
+    if install -Dm755 "$BIN_PATH" "$INSTALL_DIR/rathole"; then
+      ok "Installed system binary to $INSTALL_DIR/rathole"
+    else
+      warn "install to $INSTALL_DIR failed; trying cp..."
+      cp "$BIN_PATH" "$INSTALL_DIR/rathole" && chmod +x "$INSTALL_DIR/rathole" && ok "Copied to $INSTALL_DIR/rathole" || err "Failed to place binary in $INSTALL_DIR"
+    fi
+
+    ok "Suggested test: $CONFIG_DIR/rathole --version"
+  fi
+
+  ok "Diagnosis complete."
+  return 0
 }
 
-# Create tunnel configuration
-create_config() {
-    echo -e "${CYAN}[Tunnel Setup]${NC}"
-    
-    if [[ ! -f "$CONFIG_DIR/rathole" ]]; then
-        echo -e "${RED}[ERROR] Install Rathole first!${NC}"
-        return 1
+# -----------------------
+# Tunnel config creation (interactive)
+# -----------------------
+create_tunnel_config_interactive() {
+  ensure_dirs
+  if [[ ! -f "$CONFIG_DIR/rathole" ]]; then
+    warn "rathole binary not found at $CONFIG_DIR/rathole. If not installed yet, consider using the install option first."
+  fi
+
+  echo
+  info "Choose tunnel type:"
+  echo "1) Iran Server (accept incoming connections)"
+  echo "2) Foreign Client (connect to Iran server)"
+  read -rp "Choice [1-2]: " choice
+
+  if [[ "$choice" == "1" ]]; then
+    read -rp "Port [2333]: " port
+    port=${port:-2333}
+    if command -v openssl >/dev/null 2>&1; then
+      token="$(openssl rand -hex 32 2>/dev/null || echo "default_token_$(date +%s)")"
+    else
+      token="default_token_$(date +%s)"
     fi
-    
-    echo -e "${YELLOW}Select server type:${NC}"
-    echo "1) Iran Server (Accepts connections)"
-    echo "2) Foreign Server (Connects to Iran)"
-    
-    read -p "Choice [1-2]: " choice
-    
-    if [[ $choice == "1" ]]; then
-        # Iran server config
-        read -p "Port [2333]: " port
-        port=${port:-2333}
-        
-        token=$(openssl rand -hex 32 2>/dev/null || echo "default_token_$(date +%s)")
-        
-        cat > "$CONFIG_DIR/server.toml" << EOF
+
+    cat > "$CONFIG_DIR/server.toml" <<EOF
 [server]
 bind_addr = "0.0.0.0:$port"
 default_token = "$token"
@@ -196,20 +229,21 @@ bind_addr = "0.0.0.0:$port"
 type = "tcp+udp"
 nodelay = true
 EOF
-        
-        echo -e "${GREEN}[✓] Iran server config created${NC}"
-        echo -e "${YELLOW}Config file: $CONFIG_DIR/server.toml${NC}"
-        echo -e "${YELLOW}Token: $token${NC}"
-        
-    elif [[ $choice == "2" ]]; then
-        # Foreign server config
-        read -p "Iran server IP: " ip
-        read -p "Port [2333]: " port
-        port=${port:-2333}
-        
-        token=$(openssl rand -hex 32 2>/dev/null || echo "default_token_$(date +%s)")
-        
-        cat > "$CONFIG_DIR/client.toml" << EOF
+
+    ok "Iran server config created: $CONFIG_DIR/server.toml"
+    ech "Token: $token"
+
+  elif [[ "$choice" == "2" ]]; then
+    read -rp "Iran server IP: " ip
+    read -rp "Port [2333]: " port
+    port=${port:-2333}
+    if command -v openssl >/dev/null 2>&1; then
+      token="$(openssl rand -hex 32 2>/dev/null || echo "default_token_$(date +%s)")"
+    else
+      token="default_token_$(date +%s)"
+    fi
+
+    cat > "$CONFIG_DIR/client.toml" <<EOF
 [client]
 remote_addr = "$ip:$port"
 default_token = "$token"
@@ -220,103 +254,187 @@ local_addr = "127.0.0.1:$port"
 type = "tcp+udp"
 nodelay = true
 EOF
-        
-        echo -e "${GREEN}[✓] Foreign server config created${NC}"
-        echo -e "${YELLOW}Config file: $CONFIG_DIR/client.toml${NC}"
-    else
-        echo -e "${RED}[ERROR] Invalid choice${NC}"
-    fi
+
+    ok "Foreign client config created: $CONFIG_DIR/client.toml"
+    ech "Token: $token"
+
+  else
+    err "Invalid choice."
+    return 1
+  fi
+  return 0
 }
 
+# -----------------------
+# Create systemd service for server or client
+# -----------------------
+create_and_enable_systemd() {
+  if [[ $EUID -ne 0 ]]; then
+    err "Systemd creation requires root. Rerun with sudo."
+    return 1
+  fi
+
+  ensure_dirs
+
+  echo
+  info "Create systemd service for:"
+  echo "1) Iran Server (uses server.toml)"
+  echo "2) Foreign Client (uses client.toml)"
+  read -rp "Choice [1-2]: " svc_choice
+
+  if [[ "$svc_choice" == "1" ]]; then
+    conf="$CONFIG_DIR/server.toml"
+    svc_name="rathole-server.service"
+    svc_desc="Rathole Server (Iran)"
+  elif [[ "$svc_choice" == "2" ]]; then
+    conf="$CONFIG_DIR/client.toml"
+    svc_name="rathole-client.service"
+    svc_desc="Rathole Client (Foreign)"
+  else
+    err "Invalid choice."
+    return 2
+  fi
+
+  if [[ ! -f "$conf" ]]; then
+    err "Configuration file $conf not found. Create it first."
+    return 3
+  fi
+
+  if [[ ! -x "$CONFIG_DIR/rathole" && ! -x "$INSTALL_DIR/rathole" ]]; then
+    warn "rathole binary not found in $CONFIG_DIR or $INSTALL_DIR. Proceeding will likely fail—ensure binary is installed."
+  fi
+
+  # Prefer system binary if exists
+  if [[ -x "$INSTALL_DIR/rathole" ]]; then
+    exec_path="$INSTALL_DIR/rathole"
+  else
+    exec_path="$CONFIG_DIR/rathole"
+  fi
+
+  # Create unit content
+  unit_path="/etc/systemd/system/$svc_name"
+  cat > "$unit_path" <<EOF
+[Unit]
+Description=$svc_desc
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$exec_path $conf
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  ok "Created systemd unit: $unit_path"
+
+  # Reload systemd, enable and start
+  systemctl daemon-reload || warn "daemon-reload failed"
+  systemctl enable "$svc_name" || warn "enable may have failed"
+  systemctl restart "$svc_name" || warn "start/restart may have failed; check logs with: journalctl -u $svc_name -n 200 --no-pager"
+
+  ok "Service $svc_name enabled and restarted (check status with: systemctl status $svc_name)"
+  return 0
+}
+
+# -----------------------
 # Show status
-show_status() {
-    echo -e "${CYAN}[System Status]${NC}"
-    
-    if [[ -f "$CONFIG_DIR/rathole" ]]; then
-        echo -e "${GREEN}✓ Rathole: INSTALLED${NC}"
-        echo -e "  Location: $CONFIG_DIR/rathole"
-        
-        if [[ -f "$INSTALL_DIR/rathole" ]]; then
-            echo -e "  System: $INSTALL_DIR/rathole"
+# -----------------------
+show_status_simple() {
+  echo
+  info "[System Status]"
+  if [[ -f "$CONFIG_DIR/rathole" ]]; then
+    ok "✓ Rathole: INSTALLED"
+    ech "  Location: $CONFIG_DIR/rathole"
+    if [[ -f "$INSTALL_DIR/rathole" ]]; then
+      ech "  System: $INSTALL_DIR/rathole"
+    fi
+  else
+    err "✗ Rathole: NOT INSTALLED"
+  fi
+  echo
+  info "Configuration files:"
+  [[ -f "$CONFIG_DIR/server.toml" ]] && ok "✓ server.toml (Iran)"
+  [[ -f "$CONFIG_DIR/client.toml" ]] && ok "✓ client.toml (Foreign)"
+  echo
+  info "Systemd services (if any):"
+  [[ -f /etc/systemd/system/rathole-server.service ]] && ok "✓ /etc/systemd/system/rathole-server.service"
+  [[ -f /etc/systemd/system/rathole-client.service ]] && ok "✓ /etc/systemd/system/rathole-client.service"
+  echo
+}
+
+# -----------------------
+# Interactive menu
+# -----------------------
+interactive_menu() {
+  check_root_or_warn
+  while true; do
+    clear
+    printf "%b\n" "${CYAN}========================================${NC}"
+    printf "%b\n" "${CYAN}    Rathole Manager (EN) - Menu        ${NC}"
+    printf "%b\n" "${CYAN}========================================${NC}"
+    echo
+    echo "1) Diagnose (download + inspect)"
+    echo "2) Diagnose + Install (requires root)"
+    echo "3) Create Tunnel Configuration (server / client)"
+    echo "4) Create & enable systemd service (server or client)"
+    echo "5) Show Status"
+    echo "6) Exit"
+    echo
+    read -rp "Select option [1-6]: " opt
+    case $opt in
+      1)
+        run_diagnose_and_optional_install "$VERSION" "no"
+        read -rp "Press Enter to continue..."
+        ;;
+      2)
+        if [[ $EUID -ne 0 ]]; then
+          err "Install requires sudo/root. Re-run with sudo."
+        else
+          run_diagnose_and_optional_install "$VERSION" "yes"
         fi
-    else
-        echo -e "${RED}✗ Rathole: NOT INSTALLED${NC}"
-    fi
-    
-    echo -e "\n${YELLOW}Configuration:${NC}"
-    if [[ -f "$CONFIG_DIR/server.toml" ]]; then
-        echo -e "  ${GREEN}✓ server.toml (Iran)${NC}"
-    fi
-    if [[ -f "$CONFIG_DIR/client.toml" ]]; then
-        echo -e "  ${GREEN}✓ client.toml (Foreign)${NC}"
-    fi
+        read -rp "Press Enter to continue..."
+        ;;
+      3)
+        create_tunnel_config_interactive
+        read -rp "Press Enter to continue..."
+        ;;
+      4)
+        create_and_enable_systemd
+        read -rp "Press Enter to continue..."
+        ;;
+      5)
+        show_status_simple
+        read -rp "Press Enter to continue..."
+        ;;
+      6)
+        ok "Goodbye!"
+        exit 0
+        ;;
+      *)
+        warn "Invalid option."
+        sleep 1
+        ;;
+    esac
+  done
 }
 
-# Main menu
-main_menu() {
-    while true; do
-        show_banner
-        
-        echo -e "${CYAN}Main Menu:${NC}"
-        echo -e "1) Install Rathole Core"
-        echo -e "2) Create Tunnel Configuration"
-        echo -e "3) Show Status"
-        echo -e "4) Exit"
-        echo -e "${BLUE}=========================${NC}"
-        
-        read -p "Select option: " choice
-        
-        case $choice in
-            1)
-                install_deps
-                if ! install_rathole; then
-                    echo -e "${RED}[ERROR] Installation failed. See messages above.${NC}"
-                fi
-                ;;
-            2)
-                create_config
-                ;;
-            3)
-                show_status
-                ;;
-            4)
-                echo -e "${GREEN}Goodbye!${NC}"
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}Invalid option${NC}"
-                ;;
-        esac
-        
-        echo -e "\n${YELLOW}Press Enter to continue...${NC}"
-        read -r
-    done
-}
+# -----------------------
+# Entrypoint behavior
+# -----------------------
+if [[ -t 0 && "${BASH_SOURCE[0]}" == "${0}" && ${#@} -le 1 ]]; then
+  interactive_menu
+  exit 0
+fi
 
-# Start installation
-start_install() {
-    check_root
-    show_banner
-    
-    echo -e "${GREEN}[*] Starting automatic installation...${NC}"
-    install_deps
-    if ! install_rathole; then
-        echo -e "${RED}[ERROR] Automatic installation failed. You can try the menu options to retry.${NC}"
-    else
-        echo -e "\n${GREEN}════════════════════════════════════════════════${NC}"
-        echo -e "${GREEN}✅ Installation Complete!${NC}"
-        echo -e "${GREEN}════════════════════════════════════════════════${NC}"
-        echo -e "\n${YELLOW}Quick commands:${NC}"
-        echo -e "  Test: $CONFIG_DIR/rathole --version"
-        echo -e "  Run: $CONFIG_DIR/rathole /path/to/config.toml"
-    fi
+# If non-interactive or args provided: run diagnostic (and maybe install)
+if [[ "${INSTALL_FLAG}" == "yes" ]]; then
+  run_diagnose_and_optional_install "$VERSION" "yes"
+else
+  run_diagnose_and_optional_install "$VERSION" "no"
+fi
 
-    echo -e "\n${YELLOW}Now starting interactive menu...${NC}"
-    sleep 1
-    main_menu
-}
-
-# ============================================
-# START HERE - Simple and direct
-# ============================================
-start_install
+exit 0
