@@ -1,6 +1,7 @@
+bash -c 'cat > /tmp/rathole-manager-en.sh <<'"'"'EOF'"'"'
 #!/usr/bin/env bash
 # rathole-manager-en.sh
-# Combined auto-diagnose, optional install, tunnel-config creation, and systemd service creation.
+# Auto diagnose/install/manage rathole + tunnel config + systemd + uninstall
 # Usage:
 #   Interactive: sudo ./rathole-manager-en.sh
 #   Diagnose only: ./rathole-manager-en.sh [VERSION]
@@ -20,6 +21,8 @@ fi
 
 CONFIG_DIR="/root/rathole-core"
 INSTALL_DIR="/usr/local/bin"
+LOGDIR="/var/log/rathole-manager"
+mkdir -p "$LOGDIR" 2>/dev/null || true
 
 # -----------------------
 # Colors / helpers
@@ -74,6 +77,7 @@ download_file() {
 run_diagnose_and_optional_install() {
   local ver="${1:-$VERSION}"
   local install_mode="${2:-$INSTALL_FLAG}"
+  local LOG="$LOGDIR/diagnose-$(date +%s).log"
 
   local TMPDIR
   TMPDIR="$(mktemp -d)"
@@ -82,116 +86,122 @@ run_diagnose_and_optional_install() {
   local SYS_ARCH
   SYS_ARCH="$(detect_sys_arch)"
 
-  info "System detection: uname -> $(uname -m)  mapped to -> $SYS_ARCH"
-  info "Requested rathole version: $ver"
-  info "Working temp dir: $TMPDIR"
+  echo "LOG: $LOG"
+  {
+    info "System detection: uname -> $(uname -m)  mapped to -> $SYS_ARCH"
+    info "Requested rathole version: $ver"
+    info "Working temp dir: $TMPDIR"
 
-  local URL_PRIMARY="https://github.com/rathole-org/rathole/releases/download/v${ver}/rathole-${ver}-${SYS_ARCH}-unknown-linux-gnu.tar.gz"
-  local URL_FALLBACK="https://github.com/rathole-org/rathole/releases/download/v0.4.8/rathole-0.4.8-${SYS_ARCH}-unknown-linux-gnu.tar.gz"
+    local URL_PRIMARY="https://github.com/rathole-org/rathole/releases/download/v${ver}/rathole-${ver}-${SYS_ARCH}-unknown-linux-gnu.tar.gz"
+    local URL_FALLBACK="https://github.com/rathole-org/rathole/releases/download/v0.4.8/rathole-0.4.8-${SYS_ARCH}-unknown-linux-gnu.tar.gz"
 
-  cd "$TMPDIR" || return 1
-  local ARCHIVE="rathole.tar.gz"
+    cd "$TMPDIR" || return 1
+    local ARCHIVE="rathole.tar.gz"
 
-  ok "Starting download..."
-  if ! download_file "$URL_PRIMARY" "$ARCHIVE"; then
-    warn "Primary download failed; trying fallback..."
-    if ! download_file "$URL_FALLBACK" "$ARCHIVE"; then
-      err "Both primary and fallback downloads failed. Check network or release availability."
-      ls -l "$TMPDIR" || true
-      return 2
+    ok "Starting download..."
+    if ! download_file "$URL_PRIMARY" "$ARCHIVE"; then
+      warn "Primary download failed; trying fallback..."
+      if ! download_file "$URL_FALLBACK" "$ARCHIVE"; then
+        err "Both primary and fallback downloads failed. Check network or release availability."
+        ls -l "$TMPDIR" || true
+        return 2
+      fi
     fi
-  fi
 
-  if [[ ! -s "$ARCHIVE" ]]; then
-    err "Downloaded archive is empty or missing."
-    return 3
-  fi
-  ok "Downloaded archive size: $(stat -c%s "$ARCHIVE") bytes"
+    if [[ ! -s "$ARCHIVE" ]]; then
+      err "Downloaded archive is empty or missing."
+      return 3
+    fi
+    ok "Downloaded archive size: $(stat -c%s "$ARCHIVE") bytes"
 
-  # Check for HTML content (common if GitHub returned a 404 page)
-  if grep -I -m1 -E '<!DOCTYPE|<html|<title>' "$ARCHIVE" >/dev/null 2>&1; then
-    warn "Downloaded file contains HTML -> likely a 404/HTML error page instead of tar.gz."
-    echo "---- excerpt ----"
-    head -c 200 "$ARCHIVE" || true
-    echo
-    echo "---- end excerpt ----"
-    err "Aborting: archive appears to be HTML. Verify the release URL or network access."
-    return 4
-  fi
+    # Check for HTML content (common if GitHub returned a 404 page)
+    if grep -I -m1 -E '<!DOCTYPE|<html|<title>' "$ARCHIVE" >/dev/null 2>&1; then
+      warn "Downloaded file contains HTML -> likely a 404/HTML error page instead of tar.gz."
+      echo "---- excerpt ----"
+      head -c 200 "$ARCHIVE" || true
+      echo
+      echo "---- end excerpt ----"
+      err "Aborting: archive appears to be HTML. Verify the release URL or network access."
+      return 4
+    fi
 
-  ech
-  ok "Archive contents (first 200 lines):"
-  tar -tzf "$ARCHIVE" | sed -n '1,200p' || { err "tar could not list archive."; return 5; }
-
-  local EXTRACT_DIR="$TMPDIR/extracted"
-  mkdir -p "$EXTRACT_DIR"
-  ok "Extracting archive..."
-  tar -xzf "$ARCHIVE" -C "$EXTRACT_DIR" || { err "Extraction failed."; return 6; }
-
-  find "$EXTRACT_DIR" -maxdepth 4 -ls || true
-
-  local BIN_PATH
-  BIN_PATH="$(find "$EXTRACT_DIR" -type f -iname 'rathole' -print -quit || true)"
-  if [[ -z "$BIN_PATH" ]]; then
-    err "No file named 'rathole' found inside the archive."
-    return 7
-  fi
-
-  ok "Candidate binary found: $BIN_PATH"
-  if command -v file >/dev/null 2>&1; then
-    file "$BIN_PATH" || true
-  fi
-  stat -c "%A %U %G %s bytes %n" "$BIN_PATH" || true
-
-  if [[ ! -x "$BIN_PATH" ]]; then
-    warn "Executable bit not set; attempting chmod +x..."
-    chmod +x "$BIN_PATH" || true
-  fi
-
-  if command -v ldd >/dev/null 2>&1; then
     ech
-    warn "ldd output (may error for static or incompatible-arch binaries):"
-    ldd "$BIN_PATH" 2>&1 | sed -n '1,200p' || true
-  else
-    warn "ldd not available; cannot show linked libraries."
-  fi
+    ok "Archive contents (first 200 lines):"
+    tar -tzf "$ARCHIVE" | sed -n '1,200p' || { err "tar could not list archive."; return 5; }
+
+    local EXTRACT_DIR="$TMPDIR/extracted"
+    mkdir -p "$EXTRACT_DIR"
+    ok "Extracting archive..."
+    tar -xzf "$ARCHIVE" -C "$EXTRACT_DIR" || { err "Extraction failed."; return 6; }
+
+    find "$EXTRACT_DIR" -maxdepth 4 -ls || true
+
+    local BIN_PATH
+    BIN_PATH="$(find "$EXTRACT_DIR" -type f -iname 'rathole' -print -quit || true)"
+    if [[ -z "$BIN_PATH" ]]; then
+      err "No file named 'rathole' found inside the archive."
+      return 7
+    fi
+
+    ok "Candidate binary found: $BIN_PATH"
+    if command -v file >/dev/null 2>&1; then
+      file "$BIN_PATH" || true
+    fi
+    stat -c "%A %U %G %s bytes %n" "$BIN_PATH" || true
+
+    if [[ ! -x "$BIN_PATH" ]]; then
+      warn "Executable bit not set; attempting chmod +x..."
+      chmod +x "$BIN_PATH" || true
+    fi
+
+    if command -v ldd >/dev/null 2>&1; then
+      ech
+      warn "ldd output (may error for static or incompatible-arch binaries):"
+      ldd "$BIN_PATH" 2>&1 | sed -n '1,200p' || true
+    else
+      warn "ldd not available; cannot show linked libraries."
+    fi
+
+    ech
+    warn "Trying to run '--version' (best-effort):"
+    if "$BIN_PATH" --version >/dev/null 2>&1; then
+      ok "Binary ran with --version successfully:"
+      "$BIN_PATH" --version 2>&1 | sed -n '1,200p'
+    else
+      warn "Running --version failed or produced no output (can be normal if arch mismatch)."
+    fi
+
+    # Install if requested
+    if [[ "$install_mode" == "yes" ]]; then
+      if [[ $EUID -ne 0 ]]; then
+        err "Install requested but not running as root. Re-run with sudo."
+        return 8
+      fi
+
+      ensure_dirs
+
+      if install -Dm755 "$BIN_PATH" "$CONFIG_DIR/rathole"; then
+        ok "Installed to $CONFIG_DIR/rathole"
+      else
+        warn "install failed; trying cp..."
+        cp "$BIN_PATH" "$CONFIG_DIR/rathole" && chmod +x "$CONFIG_DIR/rathole" && ok "Copied to $CONFIG_DIR/rathole" || err "Failed to place binary in $CONFIG_DIR"
+      fi
+
+      if install -Dm755 "$BIN_PATH" "$INSTALL_DIR/rathole"; then
+        ok "Installed system binary to $INSTALL_DIR/rathole"
+      else
+        warn "install to $INSTALL_DIR failed; trying cp..."
+        cp "$BIN_PATH" "$INSTALL_DIR/rathole" && chmod +x "$INSTALL_DIR/rathole" && ok "Copied to $INSTALL_DIR/rathole" || err "Failed to place binary in $INSTALL_DIR"
+      fi
+
+      ok "Suggested test: $CONFIG_DIR/rathole --version"
+    fi
+
+    ok "Diagnosis complete."
+  } 2>&1 | tee "$LOG"
 
   ech
-  warn "Trying to run '--version' (best-effort):"
-  if "$BIN_PATH" --version >/dev/null 2>&1; then
-    ok "Binary ran with --version successfully:"
-    "$BIN_PATH" --version 2>&1 | sed -n '1,200p'
-  else
-    warn "Running --version failed or produced no output (can be normal if arch mismatch)."
-  fi
-
-  # Install if requested
-  if [[ "$install_mode" == "yes" ]]; then
-    if [[ $EUID -ne 0 ]]; then
-      err "Install requested but not running as root. Re-run with sudo."
-      return 8
-    fi
-
-    ensure_dirs
-
-    if install -Dm755 "$BIN_PATH" "$CONFIG_DIR/rathole"; then
-      ok "Installed to $CONFIG_DIR/rathole"
-    else
-      warn "install failed; trying cp..."
-      cp "$BIN_PATH" "$CONFIG_DIR/rathole" && chmod +x "$CONFIG_DIR/rathole" && ok "Copied to $CONFIG_DIR/rathole" || err "Failed to place binary in $CONFIG_DIR"
-    fi
-
-    if install -Dm755 "$BIN_PATH" "$INSTALL_DIR/rathole"; then
-      ok "Installed system binary to $INSTALL_DIR/rathole"
-    else
-      warn "install to $INSTALL_DIR failed; trying cp..."
-      cp "$BIN_PATH" "$INSTALL_DIR/rathole" && chmod +x "$INSTALL_DIR/rathole" && ok "Copied to $INSTALL_DIR/rathole" || err "Failed to place binary in $INSTALL_DIR"
-    fi
-
-    ok "Suggested test: $CONFIG_DIR/rathole --version"
-  fi
-
-  ok "Diagnosis complete."
+  ech "Full diagnose log: $LOG"
   return 0
 }
 
@@ -266,7 +276,7 @@ EOF
 }
 
 # -----------------------
-# Create systemd service for server or client
+# systemd create/enable/start
 # -----------------------
 create_and_enable_systemd() {
   if [[ $EUID -ne 0 ]]; then
@@ -341,6 +351,47 @@ EOF
 }
 
 # -----------------------
+# Uninstall core / remove config / remove systemd
+# -----------------------
+uninstall_core() {
+  if [[ $EUID -ne 0 ]]; then
+    err "Uninstall core requires root. Re-run with sudo."
+    return 1
+  fi
+  warn "Stopping services first (if any)..."
+  systemctl stop rathole-server.service rathole-client.service 2>/dev/null || true
+  systemctl disable rathole-server.service rathole-client.service 2>/dev/null || true
+
+  echo "Removing binaries and configs..."
+  rm -f "$CONFIG_DIR/rathole" "$INSTALL_DIR/rathole" 2>/dev/null || true
+  rm -rf "$CONFIG_DIR" 2>/dev/null || true
+  ok "Core uninstalled (removed $CONFIG_DIR and $INSTALL_DIR/rathole if present)."
+  return 0
+}
+
+remove_tunnel_configs() {
+  if [[ $EUID -ne 0 ]]; then
+    warn "Removing configs without root may fail for /root path; proceed as current user."
+  fi
+  rm -f "$CONFIG_DIR/server.toml" "$CONFIG_DIR/client.toml" 2>/dev/null || true
+  ok "Removed server.toml and client.toml from $CONFIG_DIR (if present)."
+  return 0
+}
+
+remove_systemd_services() {
+  if [[ $EUID -ne 0 ]]; then
+    err "Removing systemd services requires root. Re-run with sudo."
+    return 1
+  fi
+  systemctl stop rathole-server.service rathole-client.service 2>/dev/null || true
+  systemctl disable rathole-server.service rathole-client.service 2>/dev/null || true
+  rm -f /etc/systemd/system/rathole-server.service /etc/systemd/system/rathole-client.service 2>/dev/null || true
+  systemctl daemon-reload || true
+  ok "Removed rathole systemd unit files (if they existed)."
+  return 0
+}
+
+# -----------------------
 # Show status
 # -----------------------
 show_status_simple() {
@@ -382,9 +433,12 @@ interactive_menu() {
     echo "3) Create Tunnel Configuration (server / client)"
     echo "4) Create & enable systemd service (server or client)"
     echo "5) Show Status"
-    echo "6) Exit"
+    echo "6) Uninstall Rathole core (remove binaries & configs)"
+    echo "7) Remove Tunnel Configs (server.toml / client.toml)"
+    echo "8) Remove systemd services (rathole-server / rathole-client)"
+    echo "9) Exit"
     echo
-    read -rp "Select option [1-6]: " opt
+    read -rp "Select option [1-9]: " opt
     case $opt in
       1)
         run_diagnose_and_optional_install "$VERSION" "no"
@@ -411,6 +465,33 @@ interactive_menu() {
         read -rp "Press Enter to continue..."
         ;;
       6)
+        read -rp "Are you sure you want to uninstall core and remove binaries? [y/N] " y
+        if [[ "${y,,}" == "y" || "${y,,}" == "yes" ]]; then
+          uninstall_core
+        else
+          warn "Aborted uninstall."
+        fi
+        read -rp "Press Enter to continue..."
+        ;;
+      7)
+        read -rp "Remove tunnel config files? [y/N] " y
+        if [[ "${y,,}" == "y" || "${y,,}" == "yes" ]]; then
+          remove_tunnel_configs
+        else
+          warn "Aborted."
+        fi
+        read -rp "Press Enter to continue..."
+        ;;
+      8)
+        read -rp "Remove systemd units? [y/N] " y
+        if [[ "${y,,}" == "y" || "${y,,}" == "yes" ]]; then
+          remove_systemd_services
+        else
+          warn "Aborted."
+        fi
+        read -rp "Press Enter to continue..."
+        ;;
+      9)
         ok "Goodbye!"
         exit 0
         ;;
@@ -438,3 +519,10 @@ else
 fi
 
 exit 0
+EOF
+chmod +x /tmp/rathole-manager-en.sh
+echo "Script written to /tmp/rathole-manager-en.sh"
+echo "Run it with: sudo /tmp/rathole-manager-en.sh"
+# optionally run now:
+sudo /tmp/rathole-manager-en.sh
+'
