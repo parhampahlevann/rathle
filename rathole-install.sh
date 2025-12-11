@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================
 # Rathole Installer - No Process Substitution
-# Version: 5.1
+# Version: 5.1-fixed
 # ============================================
 
 set -e
@@ -44,24 +44,43 @@ check_root() {
 install_deps() {
     echo -e "${YELLOW}[*] Installing required tools...${NC}"
     
-    # Fix apt locks
-    for lock in /var/lib/apt/lists/lock /var/lib/dpkg/lock; do
-        if [[ -f $lock ]]; then
+    # Fix apt locks (best-effort)
+    for lock in /var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/apt/lists/lock-frontend /var/lib/dpkg/lock-frontend; do
+        if [[ -e $lock ]]; then
             rm -f $lock 2>/dev/null || true
         fi
     done
     
-    # Update and install
+    # Update and install (best-effort)
     apt-get update 2>/dev/null || true
     
-    for tool in curl wget tar; do
+    # Ensure these tools exist (including openssl)
+    for tool in curl wget tar openssl; do
         if ! command -v $tool >/dev/null 2>&1; then
             echo -e "${YELLOW}[-] Installing $tool...${NC}"
-            apt-get install -y $tool 2>/dev/null || true
+            apt-get install -y $tool 2>/dev/null || {
+                echo -e "${RED}[WARN] Could not install $tool via apt-get. Please install it manually.${NC}"
+            }
         fi
     done
     
-    echo -e "${GREEN}[✓] Tools ready${NC}"
+    echo -e "${GREEN}[✓] Tools ready (curl/wget/tar/openssl checked)${NC}"
+}
+
+# Download helper (tries wget then curl)
+download_file() {
+    local url="$1"
+    local out="$2"
+
+    if command -v wget >/dev/null 2>&1; then
+        wget -q "$url" -O "$out" && return 0
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$out" && return 0
+    fi
+
+    return 1
 }
 
 # Download and install Rathole
@@ -71,6 +90,9 @@ install_rathole() {
     # Clean old install
     rm -rf "$CONFIG_DIR" 2>/dev/null || true
     mkdir -p "$CONFIG_DIR"
+
+    # Ensure INSTALL_DIR exists
+    mkdir -p "$INSTALL_DIR" 2>/dev/null || true
     
     # Detect architecture
     ARCH=$(uname -m)
@@ -83,59 +105,63 @@ install_rathole() {
     
     echo -e "${YELLOW}[-] Architecture: $BIN_ARCH${NC}"
     
-    # Download from official release
-    URL="https://github.com/rathole-org/rathole/releases/download/v${RATHOLE_VERSION}/rathole-${RATHOLE_VERSION}-${BIN_ARCH}-unknown-linux-gnu.tar.gz"
-    
-    echo -e "${YELLOW}[-] Downloading from: $URL${NC}"
+    # Primary and fallback URLs
+    URL_PRIMARY="https://github.com/rathole-org/rathole/releases/download/v${RATHOLE_VERSION}/rathole-${RATHOLE_VERSION}-${BIN_ARCH}-unknown-linux-gnu.tar.gz"
+    URL_FALLBACK="https://github.com/rathole-org/rathole/releases/download/v0.4.8/rathole-0.4.8-${BIN_ARCH}-unknown-linux-gnu.tar.gz"
+
+    echo -e "${YELLOW}[-] Downloading from: $URL_PRIMARY${NC}"
     
     TEMP_DIR=$(mktemp -d)
-    cd "$TEMP_DIR"
+    # Ensure cleanup on exit
+    trap 'rm -rf "$TEMP_DIR"' EXIT INT TERM
+
+    cd "$TEMP_DIR" || { echo -e "${RED}[ERROR] Could not enter temp dir${NC}"; return 1; }
     
-    # Try download methods
-    if command -v wget >/dev/null 2>&1; then
-        wget -q "$URL" -O rathole.tar.gz || {
-            echo -e "${RED}[!] Download failed, trying alternative...${NC}"
-            # Alternative URL
-            wget -q "https://github.com/rathole-org/rathole/releases/download/v0.4.8/rathole-0.4.8-${BIN_ARCH}-unknown-linux-gnu.tar.gz" -O rathole.tar.gz || true
-        }
-    elif command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$URL" -o rathole.tar.gz || {
-            echo -e "${RED}[!] Download failed, trying alternative...${NC}"
-            curl -fsSL "https://github.com/rathole-org/rathole/releases/download/v0.4.8/rathole-0.4.8-${BIN_ARCH}-unknown-linux-gnu.tar.gz" -o rathole.tar.gz || true
-        }
-    else
-        echo -e "${RED}[ERROR] No download tool available${NC}"
-        exit 1
+    # Try primary then fallback
+    if ! download_file "$URL_PRIMARY" rathole.tar.gz; then
+        echo -e "${RED}[!] Primary download failed, trying fallback...${NC}"
+        if ! download_file "$URL_FALLBACK" rathole.tar.gz; then
+            echo -e "${RED}[ERROR] All downloads failed. Check network or URL.${NC}"
+            return 1
+        fi
     fi
     
     # Extract and install
     if [[ -f "rathole.tar.gz" ]]; then
-        tar -xzf rathole.tar.gz 2>/dev/null || true
+        tar -xzf rathole.tar.gz 2>/dev/null || {
+            echo -e "${RED}[ERROR] Failed to extract archive${NC}"
+            return 1
+        }
         
-        # Find binary
-        BINARY=$(find . -name "rathole" -type f | head -1)
+        # Find binary (search deeper too)
+        BINARY=$(find . -type f -name "rathole" | head -n 1 || true)
         
-        if [[ -f "$BINARY" ]]; then
-            cp "$BINARY" "$CONFIG_DIR/rathole"
-            chmod +x "$CONFIG_DIR/rathole"
+        if [[ -n "$BINARY" && -f "$BINARY" ]]; then
+            # Copy into config dir and system dir using install for proper perms
+            install -Dm755 "$BINARY" "$CONFIG_DIR/rathole" || cp "$BINARY" "$CONFIG_DIR/rathole"
+            chmod +x "$CONFIG_DIR/rathole" || true
             
-            # Also copy to /usr/local/bin for easy access
-            cp "$BINARY" "$INSTALL_DIR/rathole" 2>/dev/null || true
-            chmod +x "$INSTALL_DIR/rathole" 2>/dev/null || true
+            # Also copy to /usr/local/bin for easy access (best-effort)
+            if install -Dm755 "$BINARY" "$INSTALL_DIR/rathole" 2>/dev/null; then
+                chmod +x "$INSTALL_DIR/rathole" 2>/dev/null || true
+            else
+                cp "$BINARY" "$INSTALL_DIR/rathole" 2>/dev/null || true
+            fi
             
             echo -e "${GREEN}[✓] Rathole installed successfully!${NC}"
             echo -e "${YELLOW}Main binary: $CONFIG_DIR/rathole${NC}"
             echo -e "${YELLOW}System binary: $INSTALL_DIR/rathole${NC}"
         else
-            echo -e "${RED}[ERROR] Could not find rathole binary${NC}"
+            echo -e "${RED}[ERROR] Could not find rathole binary inside archive${NC}"
+            return 1
         fi
     else
         echo -e "${RED}[ERROR] Download failed completely${NC}"
+        return 1
     fi
-    
-    # Cleanup
-    cd /
-    rm -rf "$TEMP_DIR"
+
+    # Cleanup handled by trap
+    cd / || true
 }
 
 # Create tunnel configuration
@@ -243,7 +269,9 @@ main_menu() {
         case $choice in
             1)
                 install_deps
-                install_rathole
+                if ! install_rathole; then
+                    echo -e "${RED}[ERROR] Installation failed. See messages above.${NC}"
+                fi
                 ;;
             2)
                 create_config
@@ -261,7 +289,7 @@ main_menu() {
         esac
         
         echo -e "\n${YELLOW}Press Enter to continue...${NC}"
-        read
+        read -r
     done
 }
 
@@ -272,17 +300,19 @@ start_install() {
     
     echo -e "${GREEN}[*] Starting automatic installation...${NC}"
     install_deps
-    install_rathole
-    
-    echo -e "\n${GREEN}════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}✅ Installation Complete!${NC}"
-    echo -e "${GREEN}════════════════════════════════════════════════${NC}"
-    echo -e "\n${YELLOW}Quick commands:${NC}"
-    echo -e "  Test: $CONFIG_DIR/rathole --version"
-    echo -e "  Run: $CONFIG_DIR/rathole /path/to/config.toml"
+    if ! install_rathole; then
+        echo -e "${RED}[ERROR] Automatic installation failed. You can try the menu options to retry.${NC}"
+    else
+        echo -e "\n${GREEN}════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}✅ Installation Complete!${NC}"
+        echo -e "${GREEN}════════════════════════════════════════════════${NC}"
+        echo -e "\n${YELLOW}Quick commands:${NC}"
+        echo -e "  Test: $CONFIG_DIR/rathole --version"
+        echo -e "  Run: $CONFIG_DIR/rathole /path/to/config.toml"
+    fi
+
     echo -e "\n${YELLOW}Now starting interactive menu...${NC}"
-    
-    sleep 2
+    sleep 1
     main_menu
 }
 
