@@ -1,10 +1,6 @@
-sudo tee /root/rathole-manager.sh > /dev/null << 'EOF'
+sudo bash -c 'cat > /tmp/rathole-manager.sh << "EOF"
 #!/usr/bin/env bash
 set -e
-
-# ==========================================================
-#  Rathole Manager – Full Automatic Install + Tunnel Control
-# ==========================================================
 
 VERSION="0.5.0"
 CONFIG_DIR="/root/rathole-core"
@@ -20,9 +16,6 @@ ok(){ echo -e "${GREEN}$1${NC}"; }
 err(){ echo -e "${RED}$1${NC}"; }
 warn(){ echo -e "${YELLOW}$1${NC}"; }
 
-# ------------------------------------------
-# Detect architecture
-# ------------------------------------------
 arch_detect() {
   case "$(uname -m)" in
     x86_64|amd64) echo "x86_64" ;;
@@ -32,9 +25,6 @@ arch_detect() {
   esac
 }
 
-# ------------------------------------------
-# Install Rathole Core
-# ------------------------------------------
 install_rathole() {
   mkdir -p "$CONFIG_DIR"
   ARCH=$(arch_detect)
@@ -68,15 +58,10 @@ install_rathole() {
   "$BIN_SYSTEM" --version || true
 }
 
-# ------------------------------------------
-# Create Tunnel Config (Server IR)
-# ------------------------------------------
 create_server() {
   read -rp "Enter listen port [2333]: " PORT
   PORT=${PORT:-2333}
-
   TOKEN=$(openssl rand -hex 32)
-
   cat > "$CONFIG_DIR/server.toml" <<EOF2
 [server]
 bind_addr = "0.0.0.0:$PORT"
@@ -86,20 +71,15 @@ default_token = "$TOKEN"
 bind_addr = "0.0.0.0:$PORT"
 type = "tcp+udp"
 EOF2
-
   ok "Server config created: $CONFIG_DIR/server.toml"
   echo "TOKEN: $TOKEN"
 }
 
-# ------------------------------------------
-# Create Tunnel Config (Client Outside)
-# ------------------------------------------
 create_client() {
   read -rp "Enter Iran server IP: " IP
   read -rp "Enter Iran server port [2333]: " PORT
   PORT=${PORT:-2333}
   read -rp "Enter token: " TOKEN
-
   cat > "$CONFIG_DIR/client.toml" <<EOF3
 [client]
 remote_addr = "$IP:$PORT"
@@ -109,13 +89,9 @@ default_token = "$TOKEN"
 local_addr = "127.0.0.1:$PORT"
 type = "tcp+udp"
 EOF3
-
   ok "Client config created: $CONFIG_DIR/client.toml"
 }
 
-# ------------------------------------------
-# Create systemd server
-# ------------------------------------------
 systemd_server() {
   cat > "$SERVICE_SERVER" <<EOF4
 [Unit]
@@ -129,15 +105,11 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF4
-
   systemctl daemon-reload
   systemctl enable --now rathole-server
   ok "Rathole server service started!"
 }
 
-# ------------------------------------------
-# Create systemd client
-# ------------------------------------------
 systemd_client() {
   cat > "$SERVICE_CLIENT" <<EOF5
 [Unit]
@@ -151,15 +123,11 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF5
-
   systemctl daemon-reload
   systemctl enable --now rathole-client
   ok "Rathole client service started!"
 }
 
-# ------------------------------------------
-# Status screen
-# ------------------------------------------
 status_screen() {
   echo "========= Rathole Status ========="
   echo
@@ -171,25 +139,16 @@ status_screen() {
   echo
 }
 
-# ------------------------------------------
-# Remove All
-# ------------------------------------------
 remove_all() {
   systemctl disable --now rathole-server 2>/dev/null || true
   systemctl disable --now rathole-client 2>/dev/null || true
-
   rm -f "$SERVICE_SERVER" "$SERVICE_CLIENT"
   systemctl daemon-reload
-
   rm -rf "$CONFIG_DIR"
   rm -f "$BIN_SYSTEM"
-
   ok "Rathole core + tunnels + services removed completely."
 }
 
-# ------------------------------------------
-# Menu
-# ------------------------------------------
 menu() {
 while true; do
 echo "
@@ -206,7 +165,6 @@ echo "
 8) Exit
 "
 read -rp "Select: " CH
-
 case $CH in
  1) install_rathole ;;
  2) create_server ;;
@@ -223,3 +181,5 @@ done
 
 menu
 EOF
+bash /tmp/rathole-manager.sh
+'
