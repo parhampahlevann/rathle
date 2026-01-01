@@ -1,138 +1,90 @@
 #!/bin/bash
-clear
 
-CONFIG_PATH="/root/config.toml"
-SERVICE="/etc/systemd/system/backhaul.service"
-BIN="/usr/local/bin/backhaul"
+# ==========================================================
+#  Multiport Reverse Tunnel Manager (Server & Client)
+#  Auto Install + Status Monitoring + Encryption (SSH-based)
+# ==========================================================
 
-# ---------------- COLORS ----------------
-RED='\e[31m'
-GREEN='\e[32m'
-YELLOW='\e[33m'
-CYAN='\e[36m'
-NC='\e[0m'
+CONFIG_FILE="/etc/backhaul.conf"
 
-# ---------------- MENU ----------------
-show_menu() {
-clear
-echo -e "${CYAN}=========== Backhaul Installer Menu ===========${NC}"
-echo -e "1) Install Backhaul SERVER"
-echo -e "2) Install Backhaul CLIENT"
-echo -e "3) Enable BBR"
-echo -e "4) Reset Backhaul"
-echo -e "5) Change DNS"
-echo -e "6) Change MTU"
-echo -e "7) Reboot"
-echo -e "0) Exit"
-echo -e "${CYAN}===============================================${NC}"
-read -p "Select: " CH
-case $CH in
-1) install_server ;;
-2) install_client ;;
-3) enable_bbr ;;
-4) reset_backhaul ;;
-5) change_dns ;;
-6) change_mtu ;;
-7) reboot_system ;;
-0) exit 0 ;;
-*) show_menu ;;
-esac
+menu() {
+    clear
+    echo "=============================================="
+    echo "     Multiport Secure Reverse Tunnel Setup"
+    echo "=============================================="
+    echo "1) Install Server (Foreign Server)"
+    echo "2) Install Client (Iran Server)"
+    echo "3) Show Status & Ping Test"
+    echo "4) Exit"
+    echo "=============================================="
+    read -p "Choose an option: " opt
+
+    case $opt in
+        1) install_server ;;
+        2) install_client ;;
+        3) show_status ;;
+        4) exit 0 ;;
+        *) echo "Invalid option"; sleep 1; menu ;;
+    esac
 }
 
-# ---------------- INSTALL SERVER ----------------
+install_dependencies() {
+    apt update -y
+    apt install -y autossh openssh-server
+}
+
 install_server() {
-clear
-echo -e "${CYAN}=== Backhaul Server Install ===${NC}"
+    install_dependencies
 
-read -p "Enter Token: " TOKEN
-read -p "Transport (tcp/tcpmux/ws/wss/wsmux/wssmux): " TRANSPORT
-read -p "Listen Port: " PORT
+    echo ""
+    read -p "Enter tunnel ports (comma separated, e.g. 8000,8001,8002): " ports
+    read -p "Enter SSH username to be used: " ssh_user
 
-# Download binary
-curl -L -o $BIN https://raw.githubusercontent.com/backhaul-labs/backhaul/master/backhaul-linux-amd64
-chmod +x $BIN
+    # Create system user
+    useradd -m -s /bin/bash $ssh_user
 
-cat <<EOF > $CONFIG_PATH
-[server]
-bind_addr = "0.0.0.0:${PORT}"
-transport = "${TRANSPORT}"
-token = "${TOKEN}"
-accept_udp = true
-keepalive_period = 75
-heartbeat = 40
-nodelay = true
-channel_size = 2048
-mux_con = 4
-mux_version = 1
-mux_framesize = 32768
-mux_recievebuffer = 4194304
-mux_streambuffer = 65536
-sniffer = false
-web_port = 2060
-log_level = "info"
+    # Enable SSH access
+    mkdir -p /home/$ssh_user/.ssh
+    chmod 700 /home/$ssh_user/.ssh
 
-ports = ["443", "4000=5000"]
-EOF
+    echo "SERVER_PORTS=\"$ports\"" > $CONFIG_FILE
+    echo "SERVER_USER=\"$ssh_user\"" >> $CONFIG_FILE
 
-cat <<EOF > $SERVICE
-[Unit]
-Description=Backhaul Server
-After=network.target
-
-[Service]
-ExecStart=${BIN} -c ${CONFIG_PATH}
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable backhaul
-systemctl restart backhaul
-
-echo -e "${GREEN}Backhaul SERVER installed successfully.${NC}"
-sleep 2
-show_menu
+    echo "Server installation completed."
+    echo "Use 'ssh-copy-id $ssh_user@SERVER_IP' from client machine."
+    sleep 2
+    menu
 }
 
-# ---------------- INSTALL CLIENT ----------------
 install_client() {
-clear
-echo -e "${CYAN}=== Backhaul Client Install ===${NC}"
+    install_dependencies
 
-read -p "Server Address: " HOST
-read -p "Server Port: " PORT
-read -p "Token: " TOKEN
-read -p "Transport: " TRANSPORT
+    source $CONFIG_FILE
 
-curl -L -o $BIN https://raw.githubusercontent.com/backhaul-labs/backhaul/master/backhaul-linux-amd64
-chmod +x $BIN
+    read -p "Enter Server Public IP: " server_ip
 
-cat <<EOF > $CONFIG_PATH
-[client]
-server_addr = "${HOST}:${PORT}"
-transport = "${TRANSPORT}"
-token = "${TOKEN}"
-keepalive_period = 75
-channel_size = 2048
-mux_con = 4
-mux_framesize = 32768
-log_level = "info"
+    echo "SERVER_IP=\"$server_ip\"" >> $CONFIG_FILE
 
-forwards = [
-"8080=localhost:80"
-]
-EOF
-
-cat <<EOF > $SERVICE
+    # Create autossh service
+    cat >/etc/systemd/system/backhaul.service <<EOF
 [Unit]
-Description=Backhaul Client
+Description=Encrypted Multiport Reverse Backhaul Tunnel
 After=network.target
 
 [Service]
-ExecStart=${BIN} -c ${CONFIG_PATH}
+User=root
+Environment="AUTOSSH_GATETIME=0"
+ExecStart=/usr/bin/autossh -M 0 \\
+EOF
+
+    for p in $(echo $SERVER_PORTS | sed "s/,/ /g"); do
+        echo " -R ${p}:localhost:${p} ${SERVER_USER}@${SERVER_IP} -N \\" >> /etc/systemd/system/backhaul.service
+    done
+
+    sed -i '$ s/ \\$//' /etc/systemd/system/backhaul.service
+
+    cat >>/etc/systemd/system/backhaul.service <<EOF
+
 Restart=always
 RestartSec=3
 
@@ -140,60 +92,44 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable backhaul
-systemctl restart backhaul
+    systemctl daemon-reload
+    systemctl enable backhaul
+    systemctl start backhaul
 
-echo -e "${GREEN}Backhaul CLIENT installed successfully.${NC}"
-sleep 2
-show_menu
+    echo "Client setup completed and tunnel activated."
+    sleep 2
+    menu
 }
 
-# ---------------- ENABLE BBR ----------------
-enable_bbr() {
-echo -e "${CYAN}Enabling BBR...${NC}"
-echo "net.core.default_qdisc=fq" > /etc/sysctl.d/bbr.conf
-echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.d/bbr.conf
-sysctl --system
-echo -e "${GREEN}BBR enabled.${NC}"
-sleep 1
-show_menu
+show_status() {
+    clear
+    source $CONFIG_FILE
+
+    echo "=============================================="
+    echo "         Backhaul Connection Status"
+    echo "=============================================="
+
+    systemctl is-active --quiet backhaul
+    if [ $? -eq 0 ]; then
+        echo "Tunnel Status: ACTIVE ✓"
+    else
+        echo "Tunnel Status: INACTIVE ✗"
+    fi
+
+    echo ""
+    echo "Ping Test:"
+    ping -c 4 $SERVER_IP
+
+    echo ""
+    echo "Open Reverse Ports on Server:"
+    for p in $(echo $SERVER_PORTS | sed "s/,/ /g"); do
+        echo -n "Port $p: "
+        nc -zv $SERVER_IP $p >/dev/null 2>&1 && echo "Open ✓" || echo "Closed ✗"
+    done
+
+    echo ""
+    read -p "Press Enter to return to menu..."
+    menu
 }
 
-# ---------------- RESET BACKHAUL ----------------
-reset_backhaul() {
-systemctl stop backhaul
-rm -f $CONFIG_PATH
-rm -f $SERVICE
-systemctl daemon-reload
-echo -e "${YELLOW}Backhaul reset completed.${NC}"
-sleep 1
-show_menu
-}
-
-# ---------------- CHANGE DNS ----------------
-change_dns() {
-read -p "Enter new DNS (example: 1.1.1.1): " DNS
-echo "nameserver $DNS" > /etc/resolv.conf
-echo -e "${GREEN}DNS updated.${NC}"
-sleep 1
-show_menu
-}
-
-# ---------------- CHANGE MTU ----------------
-change_mtu() {
-read -p "Enter MTU value: " MTU
-ip link set dev eth0 mtu $MTU
-echo -e "${GREEN}MTU updated.${NC}"
-sleep 1
-show_menu
-}
-
-# ---------------- REBOOT ----------------
-reboot_system() {
-read -p "Reboot now? (y/n): " A
-[[ $A == "y" ]] && reboot
-show_menu
-}
-
-show_menu
+menu
