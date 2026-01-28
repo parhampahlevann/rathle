@@ -1,120 +1,73 @@
 #!/usr/bin/env bash
 set -e
 
-### ================= BASIC =================
-BIN="/usr/local/bin/mtproto-proxy"
-CONF_DIR="/etc/mtproxy"
-SERVICE="/etc/systemd/system/mtproxy.service"
+### ===== ROOT CHECK =====
+[[ $EUID -ne 0 ]] && { echo "Run as root"; exit 1; }
 
-if [[ $EUID -ne 0 ]]; then
-  echo "❌ Run as root"
-  exit 1
-fi
-
-clear
-echo "======================================"
-echo "   MTPulse – Ultimate Iran Edition"
-echo "======================================"
-echo ""
-
-### ================= MODE =================
-echo "Select mode:"
-echo "  1) Normal"
-echo "  2) 🇮🇷 Iran Optimized"
-read -p "Choice [1-2]: " MODE
-IRAN_MODE=0
-[[ "$MODE" == "2" ]] && IRAN_MODE=1
+### ===== VARS =====
+BIN="/usr/local/bin/mtg"
+CONF_DIR="/etc/mtg"
+CONF="$CONF_DIR/config.toml"
+SERVICE="/etc/systemd/system/mtg.service"
 
 read -p "Port [443]: " PORT
 PORT=${PORT:-443}
 
-### ================= PACKAGES =================
+### ===== BASE =====
 apt update -y
-apt install -y git curl build-essential libssl-dev zlib1g-dev xxd net-tools
+apt install -y curl jq ca-certificates
 
-### ================= SYSCTL =================
-cat > /etc/sysctl.d/99-mtproxy.conf <<EOF
+### ===== BBR (STABLE) =====
+cat > /etc/sysctl.d/99-mtg-iran.conf <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-net.core.somaxconn=8192
-net.ipv4.tcp_max_syn_backlog=8192
+
 net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_low_latency=1
+net.ipv4.tcp_mtu_probing=1
+
+net.core.netdev_max_backlog=250000
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=65535
 net.ipv4.tcp_fin_timeout=15
-net.ipv4.tcp_keepalive_time=300
+net.ipv4.tcp_keepalive_time=600
 net.ipv4.tcp_keepalive_intvl=30
 net.ipv4.tcp_keepalive_probes=5
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.ipv4.tcp_rmem=4096 87380 67108864
-net.ipv4.tcp_wmem=4096 65536 67108864
 EOF
-
-if [[ $IRAN_MODE -eq 1 ]]; then
-cat >> /etc/sysctl.d/99-mtproxy.conf <<EOF
-net.ipv4.tcp_syn_retries=3
-net.ipv4.tcp_synack_retries=3
-net.ipv4.tcp_retries2=5
-net.ipv4.tcp_tw_reuse=1
-EOF
-fi
-
 sysctl --system >/dev/null
 
-### ================= BUILD =================
-echo "📥 Building MTProxy (smart mode)..."
-rm -rf /tmp/MTProxy
-git clone https://github.com/TelegramMessenger/MTProxy.git /tmp/MTProxy
-cd /tmp/MTProxy
+### ===== DOWNLOAD MTG =====
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64) A="linux-amd64" ;;
+  aarch64) A="linux-arm64" ;;
+  *) echo "Unsupported arch"; exit 1 ;;
+esac
 
-build_ok=0
+curl -fsSL "https://github.com/9seconds/mtg/releases/latest/download/mtg-$A" -o "$BIN"
+chmod +x "$BIN"
 
-echo "▶ Try optimized build"
-make clean || true
-if make -j$(nproc) CC=gcc; then
-  build_ok=1
-fi
-
-if [[ $build_ok -eq 0 ]]; then
-  echo "▶ Try portable build"
-  make clean
-  if make -j$(nproc) CC=gcc CFLAGS="-O2 -fno-omit-frame-pointer"; then
-    build_ok=1
-  fi
-fi
-
-if [[ $build_ok -eq 0 ]]; then
-  echo "▶ Try NO_AESNI build"
-  make clean
-  if make -j$(nproc) CC=gcc CFLAGS="-O2 -DNO_AESNI"; then
-    build_ok=1
-  fi
-fi
-
-if [[ $build_ok -eq 0 ]]; then
-  echo "❌ Build failed – trying prebuilt binary"
-  curl -fsSL https://github.com/TelegramMessenger/MTProxy/releases/latest/download/mtproto-proxy -o $BIN
-  chmod +x $BIN
-else
-  cp objs/bin/mtproto-proxy $BIN
-  chmod +x $BIN
-fi
-
-### ================= CONFIG =================
-mkdir -p $CONF_DIR
-curl -fsSL https://core.telegram.org/getProxySecret -o $CONF_DIR/proxy-secret
-curl -fsSL https://core.telegram.org/getProxyConfig -o $CONF_DIR/proxy.conf
+### ===== CONFIG =====
+mkdir -p "$CONF_DIR"
 SECRET=$(head -c 16 /dev/urandom | xxd -ps)
 
-### ================= SYSTEMD =================
-cat > $SERVICE <<EOF
+cat > "$CONF" <<EOF
+bind = "0.0.0.0:$PORT"
+secret = "dd$SECRET"
+workers = 0
+EOF
+
+### ===== SYSTEMD =====
+cat > "$SERVICE" <<EOF
 [Unit]
-Description=MTProto Proxy
+Description=MTG MTProto Proxy (Iran Stable)
 After=network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=$BIN -H $PORT -S $SECRET --aes-pwd $CONF_DIR/proxy-secret -c $CONF_DIR/proxy.conf -M 1
+ExecStart=$BIN run $CONF
 Restart=always
-RestartSec=3
+RestartSec=2
 LimitNOFILE=1048576
 
 [Install]
@@ -122,24 +75,19 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable mtproxy
-systemctl restart mtproxy
+systemctl enable mtg
+systemctl restart mtg
 
-### ================= FIREWALL =================
-command -v ufw >/dev/null 2>&1 && ufw allow $PORT/tcp >/dev/null 2>&1 || true
-
-### ================= INFO =================
+### ===== INFO =====
 IP=$(curl -s https://api.ipify.org)
 
 echo ""
 echo "======================================"
-echo " ✅ MTProxy Ready"
+echo " ✅ MTG Iran-Stable READY"
 echo "======================================"
-echo " Mode   : $( [[ $IRAN_MODE -eq 1 ]] && echo "Iran Optimized 🇮🇷" || echo "Normal" )"
 echo " Server : $IP"
 echo " Port   : $PORT"
-echo " Secret : $SECRET"
+echo " Secret : dd$SECRET"
 echo ""
 echo " tg://proxy?server=$IP&port=$PORT&secret=dd$SECRET"
-echo ""
-systemctl --no-pager status mtproxy | head -12
+echo "======================================"
