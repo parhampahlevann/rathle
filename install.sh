@@ -2,7 +2,7 @@
 
 # ============================================
 # MTProto Proxy Ultimate Manager
-# Version: 6.0 - Complete Menu & Sponsor Tag
+# Version: 6.1 - Fixed Syntax Error
 # ============================================
 
 # Colors for output
@@ -21,7 +21,7 @@ SERVICE_NAME="MTProxy"
 CONFIG_FILE="$PROXY_DIR/objs/bin/mtconfig.conf"
 SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 LOG_FILE="/var/log/MTProxy.log"
-SCRIPT_VERSION="6.0"
+SCRIPT_VERSION="6.1"
 BOT_URL="https://t.me/MTProxybot"
 REPO_URL="https://github.com/TelegramMessenger/MTProxy"
 
@@ -65,7 +65,7 @@ show_banner() {
     clear_screen
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║                  MTProto Proxy Manager v6.0                 ║"
+    echo "║                  MTProto Proxy Manager v6.1                 ║"
     echo "║           Build & Manage Telegram Proxies Fast!             ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -1027,7 +1027,12 @@ show_main_menu() {
         fi
         
         if $PROXY_INSTALLED; then
-            echo "  Port: $PORT | Secrets: ${#SECRET_ARY[@]} | Tag: ${TAG:[:20]}..."
+            # Fixed line: removed the problematic syntax
+            if [ -n "$TAG" ]; then
+                echo "  Port: $PORT | Secrets: ${#SECRET_ARY[@]} | Tag: $(echo $TAG | cut -c1-20)..."
+            else
+                echo "  Port: $PORT | Secrets: ${#SECRET_ARY[@]} | Tag: None"
+            fi
         fi
         
         echo ""
@@ -1355,4 +1360,5 @@ main() {
     show_main_menu
 }
 
+# Run the script
 main "$@"
