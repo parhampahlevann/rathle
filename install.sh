@@ -247,7 +247,7 @@ install_mtproxy_enhanced() {
     # Download latest configs
     print_info "Downloading latest config files..."
     sudo curl -s --max-time 30 https://core.telegram.org/getProxySecret -o "$CONFIG_DIR/proxy-secret"
-    sudo curl -s --max-time 30 https://core.telegram.org/getProxyConfig" -o "$CONFIG_DIR/proxy-multi.conf"
+    sudo curl -s --max-time 30 https://core.telegram.org/getProxyConfig -o "$CONFIG_DIR/proxy-multi.conf"
     
     # Install stability tweaks
     install_stability_tweaks
@@ -456,7 +456,9 @@ EOF
     echo -e "  ${CYAN}Server IP:${RESET} ${WHITE}$public_ip${RESET}"
     echo -e "  ${CYAN}Port:${RESET} ${WHITE}$port${RESET}"
     echo -e "  ${CYAN}Secret:${RESET} ${WHITE}$secret${RESET}"
-    [[ -n "$tag" ]] && echo -e "  ${CYAN}AD Tag:${RESET} ${MAGENTA}$tag${RESET}"
+    if [[ -n "$tag" ]]; then
+        echo -e "  ${CYAN}AD Tag:${RESET} ${MAGENTA}$tag${RESET}"
+    fi
     echo ""
     echo -e "${BOLD_CYAN}Connection Link:${RESET}"
     echo -e "tg://proxy?server=$public_ip&port=$port&secret=$secret"
@@ -571,9 +573,15 @@ show_proxy_details() {
     echo -e "  ${CYAN}📌 Basic Information:${RESET}"
     echo -e "    Name: ${WHITE}$name${RESET}"
     echo -e "    Port: ${WHITE}$port${RESET}"
-    echo -e "    Status: $(systemctl is-active --quiet "mtpulse-$name" && echo "${GREEN}Active${RESET}" || echo "${RED}Inactive${RESET}")"
+    if systemctl is-active --quiet "mtpulse-$name"; then
+        echo -e "    Status: ${GREEN}Active${RESET}"
+    else
+        echo -e "    Status: ${RED}Inactive${RESET}"
+    fi
     echo -e "    Created: ${WHITE}$created_at${RESET}"
-    [ -n "$tag" ] && echo -e "    AD Tag: ${MAGENTA}$tag${RESET}"
+    if [ -n "$tag" ]; then
+        echo -e "    AD Tag: ${MAGENTA}$tag${RESET}"
+    fi
     
     echo ""
     
@@ -646,13 +654,19 @@ show_proxy_logs() {
     
     echo ""
     echo -e "${YELLOW}--- Error Logs ---${RESET}"
-    sudo tail -n 50 "$LOG_DIR/$proxy_name-error.log" 2>/dev/null || \
+    if [ -f "$LOG_DIR/$proxy_name-error.log" ]; then
+        sudo tail -n 50 "$LOG_DIR/$proxy_name-error.log"
+    else
         echo "No error logs found"
+    fi
     
     echo ""
     echo -e "${YELLOW}--- Health Check Logs ---${RESET}"
-    sudo tail -n 50 "$LOG_DIR/$proxy_name-health.log" 2>/dev/null || \
+    if [ -f "$LOG_DIR/$proxy_name-health.log" ]; then
+        sudo tail -n 50 "$LOG_DIR/$proxy_name-health.log"
+    else
         echo "No health logs found"
+    fi
 }
 
 show_proxy_stats() {
@@ -691,24 +705,33 @@ show_proxy_stats() {
     # CPU usage
     echo ""
     echo -e "${CYAN}CPU Usage:${RESET}"
-    ps -p "$pid" -o %cpu,etime,time --no-headers | awk '{print "  CPU: "$1"% | Uptime: "$2" | CPU Time: "$3}'
+    ps -p "$pid" -o %cpu,etime,time --no-headers 2>/dev/null | awk '{print "  CPU: "$1"% | Uptime: "$2" | CPU Time: "$3}'
     
     # Connections
     echo ""
     echo -e "${CYAN}Network Connections:${RESET}"
-    local connections=$(sudo ss -tnp | grep "pid=$pid" | wc -l)
+    local connections=$(sudo ss -tnp 2>/dev/null | grep "pid=$pid" | wc -l)
     echo -e "  Active Connections: ${WHITE}$connections${RESET}"
     
     # Service uptime
     echo ""
     echo -e "${CYAN}Service Information:${RESET}"
-    systemctl show "mtpulse-$proxy_name" --property=ActiveEnterTimestamp --value 2>/dev/null | \
-        awk '{print "  Started: "$1" "$2" "$3}'
+    local start_time=$(systemctl show "mtpulse-$proxy_name" --property=ActiveEnterTimestamp --value 2>/dev/null)
+    if [ -n "$start_time" ]; then
+        echo -e "  Started: $start_time"
+    else
+        echo -e "  Started: Unknown"
+    fi
     
     # Disk usage
     echo ""
     echo -e "${CYAN}Disk Usage:${RESET}"
-    sudo du -sh "$CONFIG_DIR/proxies/$proxy_name" 2>/dev/null || echo "  Config: Not found"
+    if [ -d "$CONFIG_DIR/proxies/$proxy_name" ]; then
+        local disk_usage=$(sudo du -sh "$CONFIG_DIR/proxies/$proxy_name" 2>/dev/null | awk '{print $1}')
+        echo -e "  Config: ${WHITE}$disk_usage${RESET}"
+    else
+        echo -e "  Config: Not found"
+    fi
 }
 
 # --- Monitor All Proxies ---
@@ -744,7 +767,7 @@ monitor_all_proxies() {
             
             # Get memory usage
             if [ -f "/proc/$pid/status" ]; then
-                mem_usage=$(grep VmRSS "/proc/$pid/status" | awk '{printf "%.1f MB", $2/1024}')
+                mem_usage=$(grep VmRSS "/proc/$pid/status" | awk '{printf "%.1f MB", $2/1024}' 2>/dev/null || echo "N/A")
             fi
             
             # Get uptime
@@ -866,7 +889,9 @@ backup_all_proxies() {
     done < "$PROXY_DB"
     
     # Backup configs
-    sudo cp -r "$CONFIG_DIR" "$backup_dir/config"
+    if [ -d "$CONFIG_DIR" ]; then
+        sudo cp -r "$CONFIG_DIR" "$backup_dir/config"
+    fi
     
     # Create restore script
     cat > "$backup_dir/restore.sh" <<'EOF'
@@ -932,7 +957,7 @@ update_all_proxies() {
     
     # Update config files
     sudo curl -s --max-time 30 https://core.telegram.org/getProxySecret -o "$CONFIG_DIR/proxy-secret"
-    sudo curl -s --max-time 30 https://core.telegram.org/getProxyConfig" -o "$CONFIG_DIR/proxy-multi.conf"
+    sudo curl -s --max-time 30 https://core.telegram.org/getProxyConfig -o "$CONFIG_DIR/proxy-multi.conf"
     
     # Restart all proxies
     restart_all_proxies
@@ -1118,14 +1143,20 @@ view_logs() {
         2)
             echo -e -n "👉 ${BOLD_MAGENTA}Proxy name: ${RESET}"
             read proxy_name
-            sudo tail -n 50 "$LOG_DIR/$proxy_name-error.log" 2>/dev/null || \
+            if [ -f "$LOG_DIR/$proxy_name-error.log" ]; then
+                sudo tail -n 50 "$LOG_DIR/$proxy_name-error.log"
+            else
                 echo "No error logs found"
+            fi
             ;;
         3)
             echo -e -n "👉 ${BOLD_MAGENTA}Proxy name: ${RESET}"
             read proxy_name
-            sudo tail -n 50 "$LOG_DIR/$proxy_name-health.log" 2>/dev/null || \
+            if [ -f "$LOG_DIR/$proxy_name-health.log" ]; then
+                sudo tail -n 50 "$LOG_DIR/$proxy_name-health.log"
+            else
                 echo "No health logs found"
+            fi
             ;;
         4)
             sudo dmesg | tail -n 50
@@ -1147,12 +1178,14 @@ view_logs() {
 main_menu() {
     clear
     echo -e "${BOLD_CYAN}"
-    echo "███╗   ███╗████████╗██████╗ ██████╗ ██╗   ██╗███████╗███████╗"
-    echo "████╗ ████║╚══██╔══╝██╔══██╗██╔══██╗██║   ██║██╔════╝██╔════╝"
-    echo "██╔████╔██║   ██║   ██████╔╝██████╔╝██║   ██║███████╗█████╗  "
-    echo "██║╚██╔╝██║   ██║   ██╔═══╝ ██╔═══╝ ██║   ██║╚════██║██╔══╝  "
-    echo "██║ ╚═╝ ██║   ██║   ██║     ██║     ╚██████╔╝███████║███████╗"
-    echo "╚═╝     ╚═╝   ╚═╝   ╚═╝     ╚═╝      ╚═════╝ ╚══════╝╚══════╝"
+    cat << "EOF"
+███╗   ███╗████████╗██████╗ ██████╗ ██╗   ██╗███████╗███████╗
+████╗ ████║╚══██╔══╝██╔══██╗██╔══██╗██║   ██║██╔════╝██╔════╝
+██╔████╔██║   ██║   ██████╔╝██████╔╝██║   ██║███████╗█████╗  
+██║╚██╔╝██║   ██║   ██╔═══╝ ██╔═══╝ ██║   ██║╚════██║██╔══╝  
+██║ ╚═╝ ██║   ██║   ██║     ██║     ╚██████╔╝███████║███████╗
+╚═╝     ╚═╝   ╚═╝   ╚═╝     ╚═╝      ╚═════╝ ╚══════╝╚══════╝
+EOF
     echo -e "${RESET}"
     draw_line "$CYAN" "=" 60
     echo -e "${BOLD_YELLOW}     Professional MTProto Proxy Manager with High Stability${RESET}"
