@@ -26,7 +26,7 @@ CONFIG_DIR="/etc/mtpulse"
 PROXY_DB="$CONFIG_DIR/proxies.db"  # Database of all proxies
 LOG_DIR="/var/log/mtpulse"
 SETUP_MARKER="$CONFIG_DIR/.setup_complete"
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 
 # Error handling
 set -euo pipefail
@@ -170,7 +170,7 @@ EOF
     print_success "Stability tweaks applied"
 }
 
-# --- Enhanced MTProxy Installation ---
+# --- Enhanced MTProxy Installation (ARM Compatible) ---
 install_mtproxy_enhanced() {
     clear
     echo ""
@@ -222,9 +222,56 @@ install_mtproxy_enhanced() {
         sed -i 's/#define MAX_WORKERS .*/#define MAX_WORKERS 16/' server/worker.c
     fi
     
+    # Patch 4: Fix rdtsc function declaration for ARM
+    if [ -f "common/kprintf.h" ]; then
+        if grep -q "static inline long long rdtsc" common/kprintf.h; then
+            print_info "rdtsc function already exists"
+        else
+            echo "static inline long long rdtsc (void) { return 0; }" >> common/kprintf.h
+        fi
+    fi
+    
+    # Check CPU architecture for compilation flags
+    local cpu_arch=$(uname -m)
+    local compile_flags="-O3 -pipe -flto"
+    
+    if [[ "$cpu_arch" == "x86_64" ]]; then
+        compile_flags="$compile_flags -march=native"
+        print_info "Compiling for x86_64 with native optimizations"
+    elif [[ "$cpu_arch" == "aarch64" ]] || [[ "$cpu_arch" == "arm64" ]]; then
+        compile_flags="$compile_flags -mcpu=native"
+        print_info "Compiling for ARM64 (aarch64)"
+        # Disable SSE/SSE2 instructions for ARM
+        sed -i 's/-msse4.2//g' Makefile
+        sed -i 's/-mpclmul//g' Makefile
+    else
+        print_warning "Unknown architecture $cpu_arch, using generic flags"
+    fi
+    
     # Compile with optimizations
     print_info "Compiling with optimizations..."
-    make CFLAGS="-O3 -march=native -pipe -flto" -j$(nproc)
+    
+    # Show compilation progress
+    echo -e "${YELLOW}Compilation may take 2-5 minutes...${RESET}"
+    
+    # Run make with specific flags
+    make CFLAGS="$compile_flags" -j$(nproc) 2>&1 | tee /tmp/mtpulse_compile.log || {
+        print_error "Compilation failed. Trying alternative approach..."
+        
+        # Try without optimizations
+        print_info "Trying simpler compilation..."
+        make clean
+        make -j$(nproc) 2>&1 | tee -a /tmp/mtpulse_compile.log
+        
+        if [ ! -f "objs/bin/mtproto-proxy" ]; then
+            print_error "Compilation failed completely"
+            echo -e "${YELLOW}Last 20 lines of log:${RESET}"
+            tail -20 /tmp/mtpulse_compile.log
+            cd "$SCRIPT_DIR"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+    }
     
     if [ ! -f "objs/bin/mtproto-proxy" ]; then
         print_error "Compilation failed"
@@ -236,7 +283,7 @@ install_mtproxy_enhanced() {
     # Install
     sudo cp objs/bin/mtproto-proxy /usr/local/bin/mtproto-proxy
     sudo chmod +x /usr/local/bin/mtproto-proxy
-    sudo strip /usr/local/bin/mtproto-proxy
+    sudo strip /usr/local/bin/mtproto-proxy 2>/dev/null || true
     
     # Cleanup
     cd "$SCRIPT_DIR"
@@ -291,7 +338,7 @@ create_proxy() {
         # Validate port
         if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
             # Check port availability
-            if ss -tuln | grep -q ":$port "; then
+            if ss -tuln 2>/dev/null | grep -q ":$port "; then
                 print_error "Port $port is already in use"
             else
                 break
@@ -302,7 +349,7 @@ create_proxy() {
     done
     
     # Generate strong secret
-    local secret=$(openssl rand -hex 16)
+    local secret=$(openssl rand -hex 16 2>/dev/null || head -c 32 /dev/urandom | xxd -ps)
     echo -e "Secret: ${WHITE}$secret${RESET}"
     
     # AD Tag (optional)
@@ -314,10 +361,21 @@ create_proxy() {
     local proxy_dir="$CONFIG_DIR/proxies/$proxy_name"
     sudo mkdir -p "$proxy_dir"
     
+    # Get public IP
+    local public_ip=$(curl -s --max-time 5 https://api.ipify.org || echo "127.0.0.1")
+    
     # Create enhanced service file
     print_info "Creating service..."
     
     local service_file="/etc/systemd/system/mtpulse-$proxy_name.service"
+    
+    # Build ExecStart command
+    local exec_start="/usr/local/bin/mtproto-proxy -u nobody -p 8888 -H $port -S $secret --aes-pwd $CONFIG_DIR/proxy-secret $CONFIG_DIR/proxy-multi.conf -M 1 --ddos-protection --proxy-tag-refresh-interval 86400 --tcp-fast-open --nat-info $public_ip:$port --verbosity 0"
+    
+    if [[ -n "$tag" ]]; then
+        exec_start="$exec_start -P $tag"
+    fi
+    
     cat <<EOF | sudo tee "$service_file" > /dev/null
 [Unit]
 Description=MTPulse Proxy - $proxy_name (Port: $port)
@@ -359,20 +417,7 @@ StandardError=append:$LOG_DIR/$proxy_name-error.log
 SyslogIdentifier=mtpulse-$proxy_name
 
 # Main command
-ExecStart=/usr/local/bin/mtproto-proxy \
-  -u nobody \
-  -p 8888 \
-  -H $port \
-  -S $secret \
-  --aes-pwd $CONFIG_DIR/proxy-secret \
-  $CONFIG_DIR/proxy-multi.conf \
-  -M 1 \
-  --ddos-protection \
-  --proxy-tag-refresh-interval 86400 \
-  --tcp-fast-open \
-  ${tag:+-P $tag} \
-  --nat-info $(curl -s https://api.ipify.org):$port \
-  --verbosity 0
+ExecStart=$exec_start
 
 # Health check
 ExecStartPost=/bin/bash -c 'echo "Service started at \$(date)" >> $LOG_DIR/$proxy_name-health.log'
@@ -384,26 +429,27 @@ EOF
     
     # Create health check script
     local health_script="$proxy_dir/health-check.sh"
-    cat <<EOF | sudo tee "$health_script" > /dev/null
+    cat <<'EOF' | sudo tee "$health_script" > /dev/null
 #!/bin/bash
-# Health check for proxy $proxy_name
-PORT=$port
-SECRET="$secret"
-PROXY_NAME="$proxy_name"
+# Health check script for MTProxy
+
+PROXY_NAME="$1"
+PORT="$2"
+LOG_DIR="/var/log/mtpulse"
 
 # Check if port is listening
-if ! ss -tln | grep -q ":$PORT "; then
-    echo "\$(date): Port \$PORT not listening" >> $LOG_DIR/\$PROXY_NAME-health.log
+if ! ss -tln 2>/dev/null | grep -q ":$PORT "; then
+    echo "$(date): Port $PORT not listening" >> "$LOG_DIR/$PROXY_NAME-health.log"
     exit 1
 fi
 
 # Simple connectivity test
 if ! timeout 5 curl -s "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
-    echo "\$(date): Local connectivity test failed" >> $LOG_DIR/\$PROXY_NAME-health.log
+    echo "$(date): Local connectivity test failed" >> "$LOG_DIR/$PROXY_NAME-health.log"
     exit 1
 fi
 
-echo "\$(date): Health check passed" >> $LOG_DIR/\$PROXY_NAME-health.log
+echo "$(date): Health check passed" >> "$LOG_DIR/$PROXY_NAME-health.log"
 exit 0
 EOF
     
@@ -430,7 +476,7 @@ After=mtpulse-$proxy_name.service
 
 [Service]
 Type=oneshot
-ExecStart=$health_script
+ExecStart=$health_script $proxy_name $port
 EOF
     
     # Enable and start
@@ -442,9 +488,6 @@ EOF
     
     # Add to database
     add_proxy_to_db "$proxy_name" "$port" "$secret" "$tag"
-    
-    # Show connection info
-    local public_ip=$(curl -s --max-time 5 https://api.ipify.org || echo "Unknown IP")
     
     clear
     echo ""
@@ -468,7 +511,7 @@ EOF
     echo ""
     draw_line "$CYAN" "-" 60
     echo -e "${YELLOW}📊 Service Status:${RESET}"
-    sudo systemctl status "mtpulse-$proxy_name.service" --no-pager -l
+    sudo systemctl status "mtpulse-$proxy_name.service" --no-pager -l | head -20
     echo ""
     
     echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"
@@ -695,8 +738,8 @@ show_proxy_stats() {
     
     # Memory usage
     if [ -f "/proc/$pid/status" ]; then
-        local vm_size=$(grep VmSize "/proc/$pid/status" | awk '{printf "%.1f MB", $2/1024}')
-        local vm_rss=$(grep VmRSS "/proc/$pid/status" | awk '{printf "%.1f MB", $2/1024}')
+        local vm_size=$(grep VmSize "/proc/$pid/status" 2>/dev/null | awk '{printf "%.1f MB", $2/1024}')
+        local vm_rss=$(grep VmRSS "/proc/$pid/status" 2>/dev/null | awk '{printf "%.1f MB", $2/1024}')
         echo -e "${CYAN}Memory Usage:${RESET}"
         echo -e "  Virtual Memory: ${WHITE}$vm_size${RESET}"
         echo -e "  Resident Memory: ${WHITE}$vm_rss${RESET}"
@@ -767,7 +810,7 @@ monitor_all_proxies() {
             
             # Get memory usage
             if [ -f "/proc/$pid/status" ]; then
-                mem_usage=$(grep VmRSS "/proc/$pid/status" | awk '{printf "%.1f MB", $2/1024}' 2>/dev/null || echo "N/A")
+                mem_usage=$(grep VmRSS "/proc/$pid/status" 2>/dev/null | awk '{printf "%.1f MB", $2/1024}' || echo "N/A")
             fi
             
             # Get uptime
@@ -877,7 +920,9 @@ backup_all_proxies() {
     print_info "Creating backup in $backup_dir..."
     
     # Backup database
-    sudo cp "$PROXY_DB" "$backup_dir/proxies.db"
+    if [ -f "$PROXY_DB" ]; then
+        sudo cp "$PROXY_DB" "$backup_dir/proxies.db"
+    fi
     
     # Backup service files
     while IFS='|' read -r name port secret tag status created_at last_check; do
