@@ -2,7 +2,7 @@
 
 # ============================================
 # MTProto Proxy Complete Fix Script
-# Version: 7.0 - Fixed All Installation Issues
+# Version: 7.1 - All Issues Fixed
 # ============================================
 
 # Colors for output
@@ -21,7 +21,7 @@ SERVICE_NAME="mtproxy"
 CONFIG_FILE="$PROXY_DIR/mtconfig.conf"
 SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 LOG_FILE="/var/log/mtproxy.log"
-SCRIPT_VERSION="7.0"
+SCRIPT_VERSION="7.1"
 
 # Current Configuration
 PORT=""
@@ -47,6 +47,8 @@ print_info() { echo -e "${BLUE}[i]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 print_error() { echo -e "${RED}[✗]${NC} $1"; }
 print_success() { echo -e "${CYAN}[✔]${NC} $1"; }
+print_menu_title() { echo -e "${MAGENTA}$1${NC}"; }
+print_menu_item() { echo -e "${WHITE}$1${NC}"; }
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -63,7 +65,7 @@ show_banner() {
     clear_screen
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║          MTProto Proxy Complete Fix Installer v7.0          ║"
+    echo "║          MTProto Proxy Complete Fix Installer v7.1          ║"
     echo "║              Solves All Installation Problems               ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -113,7 +115,7 @@ install_dependencies_complete() {
     
     case $DISTRO in
         ubuntu|debian)
-            apt-get update
+            apt-get update -y
             apt-get install -y git curl wget build-essential \
                 libssl-dev zlib1g-dev libcurl4-openssl-dev \
                 net-tools lsof xxd jq iptables iptables-persistent \
@@ -864,7 +866,7 @@ show_installation_result() {
 
 troubleshoot_installation() {
     clear_screen
-    print_menu_title "=== Troubleshooting Installation ==="
+    echo -e "${MAGENTA}=== Troubleshooting Installation ===${NC}"
     echo ""
     
     print_info "Checking common issues..."
@@ -942,7 +944,7 @@ troubleshoot_installation() {
 
 fix_binary_issues() {
     clear_screen
-    print_menu_title "=== Fix Binary Issues ==="
+    echo -e "${MAGENTA}=== Fix Binary Issues ===${NC}"
     echo ""
     
     print_info "Recompiling MTProto Proxy..."
@@ -960,7 +962,7 @@ fix_binary_issues() {
 
 fix_service_issues() {
     clear_screen
-    print_menu_title "=== Fix Service Issues ==="
+    echo -e "${MAGENTA}=== Fix Service Issues ===${NC}"
     echo ""
     
     print_info "Recreating systemd service..."
@@ -1015,28 +1017,28 @@ show_main_menu() {
         fi
         
         echo ""
-        print_menu_title "Main Menu:"
+        echo -e "${MAGENTA}Main Menu:${NC}"
         echo ""
         
         if ! $PROXY_INSTALLED; then
-            print_menu_item "  1) Complete Installation (Auto-fix)"
-            print_menu_item "  2) Quick Installation (Default)"
-            print_menu_item "  3) Custom Installation"
+            echo -e "${WHITE}  1) Complete Installation (Auto-fix)${NC}"
+            echo -e "${WHITE}  2) Quick Installation (Default)${NC}"
+            echo -e "${WHITE}  3) Custom Installation${NC}"
         else
-            print_menu_item "  1) Show Proxy Status"
-            print_menu_item "  2) View Connection Links"
-            print_menu_item "  3) Manage Secrets"
-            print_menu_item "  4) Service Control"
-            print_menu_item "  5) View Logs"
+            echo -e "${WHITE}  1) Show Proxy Status${NC}"
+            echo -e "${WHITE}  2) View Connection Links${NC}"
+            echo -e "${WHITE}  3) Manage Secrets${NC}"
+            echo -e "${WHITE}  4) Service Control${NC}"
+            echo -e "${WHITE}  5) View Logs${NC}"
         fi
         
         echo ""
-        print_menu_item "  6) Troubleshoot Installation"
-        print_menu_item "  7) Fix Binary Issues"
-        print_menu_item "  8) Fix Service Issues"
-        print_menu_item "  9) Update Configuration Files"
-        print_menu_item "  10) Uninstall Proxy"
-        print_menu_item "  0) Exit"
+        echo -e "${WHITE}  6) Troubleshoot Installation${NC}"
+        echo -e "${WHITE}  7) Fix Binary Issues${NC}"
+        echo -e "${WHITE}  8) Fix Service Issues${NC}"
+        echo -e "${WHITE}  9) Update Configuration Files${NC}"
+        echo -e "${WHITE}  10) Uninstall Proxy${NC}"
+        echo -e "${WHITE}  0) Exit${NC}"
         echo ""
         
         read -p "Select option: " choice
@@ -1113,7 +1115,7 @@ show_main_menu() {
 
 quick_installation() {
     clear_screen
-    print_menu_title "=== Quick Installation ==="
+    echo -e "${MAGENTA}=== Quick Installation ===${NC}"
     echo ""
     
     print_info "Installing with default settings..."
@@ -1129,7 +1131,7 @@ quick_installation() {
 
 custom_installation() {
     clear_screen
-    print_menu_title "=== Custom Installation ==="
+    echo -e "${MAGENTA}=== Custom Installation ===${NC}"
     echo ""
     
     # Get port
@@ -1157,7 +1159,7 @@ custom_installation() {
 
 show_proxy_status() {
     clear_screen
-    print_menu_title "=== Proxy Status ==="
+    echo -e "${MAGENTA}=== Proxy Status ===${NC}"
     echo ""
     
     if ! load_configuration; then
@@ -1190,7 +1192,7 @@ show_proxy_status() {
 
 show_connection_links() {
     clear_screen
-    print_menu_title "=== Connection Links ==="
+    echo -e "${MAGENTA}=== Connection Links ===${NC}"
     echo ""
     
     if ! load_configuration; then
@@ -1220,7 +1222,7 @@ show_connection_links() {
 
 manage_secrets() {
     clear_screen
-    print_menu_title "=== Manage Secrets ==="
+    echo -e "${MAGENTA}=== Manage Secrets ===${NC}"
     echo ""
     
     if ! load_configuration; then
@@ -1282,7 +1284,7 @@ manage_secrets() {
 
 service_control() {
     clear_screen
-    print_menu_title "=== Service Control ==="
+    echo -e "${MAGENTA}=== Service Control ===${NC}"
     echo ""
     
     echo "  1) Start Service"
@@ -1338,7 +1340,7 @@ service_control() {
 
 view_logs() {
     clear_screen
-    print_menu_title "=== View Logs ==="
+    echo -e "${MAGENTA}=== View Logs ===${NC}"
     echo ""
     
     echo "  1) Recent logs"
@@ -1394,7 +1396,7 @@ update_configuration() {
 
 uninstall_proxy() {
     clear_screen
-    print_warning "=== Uninstall MTProto Proxy ==="
+    echo -e "${YELLOW}=== Uninstall MTProto Proxy ===${NC}"
     echo ""
     
     print_warning "This will completely remove MTProto Proxy!"
