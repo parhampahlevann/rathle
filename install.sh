@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # =============================================================================
-# MTPulse - PATCHED VERSION
-# Only installation/runtime bugs fixed
+# MTPulse - Consolidated bugfixes
 # =============================================================================
 
 set -Eeuo pipefail
 
 # -----------------------------------------------------------------------------
-# Safe read wrapper (FIX set -u crash)
+# Safe read wrapper (prevents set -u crash when read fails)
 # -----------------------------------------------------------------------------
 safe_read() {
     local __var="$1"
     local __prompt="${2:-}"
     local __value=""
+    # If read fails (e.g. EOF), we still want to set the variable to empty string
     read -r -p "$__prompt" __value || __value=""
     printf -v "$__var" '%s' "$__value"
 }
@@ -20,91 +20,202 @@ safe_read() {
 trap 'echo "[FATAL] Error at line $LINENO"; exit 1' ERR
 
 # -----------------------------------------------------------------------------
-# Paths & constants (UNCHANGED)
+# Paths & constants
 # -----------------------------------------------------------------------------
 BASE_DIR="/etc/mtpulse"
 BIN="/usr/local/bin/mtproto-proxy"
 DB="$BASE_DIR/proxies.db"
 LOG_DIR="/var/log/mtpulse"
+SERVICE_DIR="/etc/systemd/system"
+REQUIRED_CMDS=(curl git make gcc g++ openssl ss systemctl)
 
 # -----------------------------------------------------------------------------
-# Root check
+# Helpers
 # -----------------------------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-    echo "Run as root"
-    exit 1
-fi
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+ensure_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Run as root"
+        exit 1
+    fi
+}
+
+ensure_cmds_or_install_hint() {
+    # Only check commands that may not exist; don't auto-fix here other than apt path below
+    local missing=()
+    for c in "${REQUIRED_CMDS[@]}"; do
+        # ss may come from iproute2; check 'ss' command presence specifically
+        if ! command_exists "$c"; then
+            missing+=("$c")
+        fi
+    done
+    # If only ss is missing, we will install iproute2 later. Don't abort here; use install_deps to fix.
+    if ((${#missing[@]})); then
+        echo "Note: Some helper commands are missing: ${missing[*]}"
+        echo "They will be installed if package manager is available."
+    fi
+}
 
 # -----------------------------------------------------------------------------
-# Init dirs (FIX missing log dir)
+# Init dirs and DB
 # -----------------------------------------------------------------------------
 init_dirs() {
     mkdir -p "$BASE_DIR" "$LOG_DIR"
-    [[ -f "$DB" ]] || echo "#NAME|PORT|SECRET|CREATED" > "$DB"
+    chown root:root "$BASE_DIR" "$LOG_DIR" || true
+    chmod 755 "$BASE_DIR" "$LOG_DIR" || true
+
+    if [[ ! -f "$DB" ]]; then
+        echo "#NAME|PORT|SECRET|CREATED" > "$DB"
+        chmod 600 "$DB" || true
+    else
+        # Ensure DB has header
+        if ! head -n1 "$DB" | grep -q '^#NAME|PORT|SECRET|CREATED'; then
+            # backup then add header
+            cp -a "$DB" "$DB".bak || true
+            sed -i '1i#NAME|PORT|SECRET|CREATED' "$DB"
+        fi
+    fi
 }
 
 # -----------------------------------------------------------------------------
-# Dependency install (FIX missing ss/iproute2)
+# Dependency install (Debian/Ubuntu apt-based) - safe and idempotent
 # -----------------------------------------------------------------------------
 install_deps() {
-    apt update
-    apt install -y \
-        git make gcc g++ \
-        libssl-dev zlib1g-dev \
-        curl iproute2
+    if command_exists apt; then
+        apt update -y
+        apt install -y \
+          git make gcc g++ \
+          libssl-dev zlib1g-dev \
+          curl iproute2 openssl ca-certificates
+    else
+        echo "apt not found. Please install dependencies manually: git make gcc g++ libssl-dev zlib1g-dev curl iproute2 openssl ca-certificates"
+        return 1
+    fi
 }
 
 # -----------------------------------------------------------------------------
-# Install MTProxy (SOURCE, original logic kept)
+# Build & install MTProxy from upstream source
 # -----------------------------------------------------------------------------
 install_mtproxy() {
-    install_deps
+    ensure_root
+    install_deps || true
 
+    # build in temporary dir
     tmp="$(mktemp -d)"
-    cd "$tmp"
+    cd "$tmp" || exit 1
 
-    git clone https://github.com/TelegramMessenger/MTProxy.git
-    cd MTProxy
+    git clone https://github.com/TelegramMessenger/MTProxy.git || { echo "git clone failed"; rm -rf "$tmp"; return 1; }
+    cd MTProxy || { rm -rf "$tmp"; return 1; }
 
     make clean || true
-    make -j"$(nproc)"
+    make -j"$(nproc)" || { echo "Build failed (make)"; cd /; rm -rf "$tmp"; return 1; }
 
-    [[ -f objs/bin/mtproto-proxy ]] || {
-        echo "Build failed"
-        exit 1
-    }
+    if [[ ! -f objs/bin/mtproto-proxy ]]; then
+        echo "Build failed: objs/bin/mtproto-proxy missing"
+        cd /
+        rm -rf "$tmp"
+        return 1
+    fi
 
-    install -m 755 objs/bin/mtproto-proxy "$BIN"
+    install -m 755 objs/bin/mtproto-proxy "$BIN" || { echo "Install to $BIN failed"; cd /; rm -rf "$tmp"; return 1; }
 
     cd /
     rm -rf "$tmp"
 
-    curl -fsSL https://core.telegram.org/getProxySecret -o "$BASE_DIR/proxy-secret"
-    curl -fsSL https://core.telegram.org/getProxyConfig -o "$BASE_DIR/proxy.conf"
+    # Download secrets/config only if missing
+    if [[ ! -f "$BASE_DIR/proxy-secret" ]]; then
+        curl -fsSL https://core.telegram.org/getProxySecret -o "$BASE_DIR/proxy-secret" || echo "Failed to download proxy-secret"
+        chmod 600 "$BASE_DIR/proxy-secret" || true
+    fi
+    if [[ ! -f "$BASE_DIR/proxy.conf" ]]; then
+        curl -fsSL https://core.telegram.org/getProxyConfig -o "$BASE_DIR/proxy.conf" || echo "Failed to download proxy.conf"
+        chmod 600 "$BASE_DIR/proxy.conf" || true
+    fi
 
-    echo "MTProxy installed successfully"
+    echo "MTProxy installed successfully at $BIN"
 }
 
 # -----------------------------------------------------------------------------
-# Create proxy (NO LOGIC REMOVED)
+# Helper to check port availability: prefer ss, fallback to netstat
+# -----------------------------------------------------------------------------
+port_in_use() {
+    local port="$1"
+    if command_exists ss; then
+        ss -lnt 2>/dev/null | awk '{print $4}' | grep -E "[:.]$port\$" >/dev/null 2>&1
+        return $?
+    elif command_exists netstat; then
+        netstat -lnt 2>/dev/null | awk '{print $4}' | grep -E "[:.]$port\$" >/dev/null 2>&1
+        return $?
+    else
+        # Last resort: try /proc/net/tcp (not perfect)
+        grep -q "$port" /proc/net/tcp 2>/dev/null || return 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Create a new proxy service
 # -----------------------------------------------------------------------------
 create_proxy() {
-    local name port secret
+    local name port secret svc ip
 
     safe_read name "Proxy name: "
-    [[ -z "$name" ]] && { echo "Empty name"; return; }
+    if [[ -z "$name" ]]; then
+        echo "Empty name"
+        return
+    fi
+    # allow only alnum, dash, underscore
+    if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        echo "Invalid name. Use only letters, numbers, hyphen and underscore."
+        return
+    fi
+
+    # check name uniqueness in DB and existing services
+    if grep -qE "^${name}\\|" "$DB"; then
+        echo "Proxy name already exists in DB"
+        return
+    fi
+    if [[ -f "$SERVICE_DIR/mtpulse-$name.service" ]]; then
+        echo "Service file already exists: $SERVICE_DIR/mtpulse-$name.service"
+        return
+    fi
 
     safe_read port "Port: "
-    [[ "$port" =~ ^[0-9]+$ ]] || { echo "Invalid port"; return; }
+    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+        echo "Invalid port"
+        return
+    fi
+    if (( port < 1 || port > 65535 )); then
+        echo "Port out of range"
+        return
+    fi
 
-    if ss -lnt | grep -q ":$port "; then
+    if port_in_use "$port"; then
         echo "Port already in use"
         return
     fi
 
-    secret="$(openssl rand -hex 16)"
+    if [[ ! -x "$BIN" ]]; then
+        echo "MTProxy binary not found at $BIN. Run option 1 to install first."
+        return
+    fi
 
-    local svc="/etc/systemd/system/mtpulse-$name.service"
+    secret="$(openssl rand -hex 16)"
+    svc="$SERVICE_DIR/mtpulse-$name.service"
+
+    # Make sure proxy-secret and proxy.conf exist
+    if [[ ! -f "$BASE_DIR/proxy-secret" ]]; then
+        echo "proxy-secret missing; downloading..."
+        curl -fsSL https://core.telegram.org/getProxySecret -o "$BASE_DIR/proxy-secret" || { echo "Failed to download proxy-secret"; return; }
+        chmod 600 "$BASE_DIR/proxy-secret"
+    fi
+    if [[ ! -f "$BASE_DIR/proxy.conf" ]]; then
+        echo "proxy.conf missing; downloading..."
+        curl -fsSL https://core.telegram.org/getProxyConfig -o "$BASE_DIR/proxy.conf" || { echo "Failed to download proxy.conf"; return; }
+        chmod 600 "$BASE_DIR/proxy.conf"
+    fi
 
     cat > "$svc" <<EOF
 [Unit]
@@ -124,11 +235,11 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now "mtpulse-$name"
+    systemctl enable --now "mtpulse-$name.service" || { echo "Failed to enable/start systemd service"; return; }
 
-    echo "$name|$port|$secret|$(date)" >> "$DB"
+    printf "%s|%s|%s|%s\n" "$name" "$port" "$secret" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$DB"
+    chmod 600 "$DB" || true
 
-    local ip
     ip="$(curl -fsSL https://api.ipify.org || echo SERVER_IP)"
 
     echo
@@ -137,27 +248,29 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
-# List proxies (FIX empty DB detection)
+# List proxies
 # -----------------------------------------------------------------------------
 list_proxies() {
-    if ! grep -q '^[^#]' "$DB"; then
+    # If DB contains only header or is missing, show message
+    if [[ ! -f "$DB" ]] || ! awk 'NR>1{print; found=1} END{exit !found}' "$DB"; then
         echo "No proxies defined"
         return
     fi
 
+    printf "%-12s %-6s %-8s %s\n" "NAME" "PORT" "STATE" "CREATED"
     while IFS='|' read -r n p s d; do
         [[ -z "$n" || "$n" == \#* ]] && continue
-        if systemctl is-active --quiet "mtpulse-$n"; then
+        if systemctl is-active --quiet "mtpulse-$n.service"; then
             st="ACTIVE"
         else
             st="STOPPED"
         fi
         printf "%-12s %-6s %-8s %s\n" "$n" "$p" "$st" "$d"
-    done < "$DB"
+    done < <(tail -n +2 "$DB")
 }
 
 # -----------------------------------------------------------------------------
-# Monitor (FIX recursion bug)
+# Monitor proxies (simple loop, non-recursive)
 # -----------------------------------------------------------------------------
 monitor_all_proxies() {
     while true; do
@@ -168,7 +281,7 @@ monitor_all_proxies() {
 }
 
 # -----------------------------------------------------------------------------
-# Menu (UNCHANGED STRUCTURE)
+# Menu
 # -----------------------------------------------------------------------------
 menu() {
     echo "=============================="
@@ -197,9 +310,13 @@ menu() {
 # -----------------------------------------------------------------------------
 # Start
 # -----------------------------------------------------------------------------
+ensure_root
+ensure_cmds_or_install_hint
 init_dirs
+
 while true; do
     menu
     echo
-    read -r
+    # pause for Enter; don't fail if stdin closed
+    read -r || true
 done
