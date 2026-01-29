@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================================
-# MTPulse v2.0 - Enhanced MTProto Proxy Manager
+# MTPulse v2.1 - Enhanced MTProto Proxy Manager
 # With High Stability and Multi-Proxy Management
 # ============================================================================
 
@@ -26,7 +26,7 @@ CONFIG_DIR="/etc/mtpulse"
 PROXY_DB="$CONFIG_DIR/proxies.db"  # Database of all proxies
 LOG_DIR="/var/log/mtpulse"
 SETUP_MARKER="$CONFIG_DIR/.setup_complete"
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.1.0"
 
 # Error handling
 set -euo pipefail
@@ -170,111 +170,132 @@ EOF
     print_success "Stability tweaks applied"
 }
 
-# --- Enhanced MTProxy Installation (ARM Compatible) ---
-install_mtproxy_enhanced() {
+# --- Precompiled MTProxy Installation (ARM Compatible) ---
+install_mtproxy_precompiled() {
     clear
     echo ""
     draw_line "$CYAN" "=" 60
-    echo -e "${BOLD_GREEN}     📥 Enhanced MTProto Proxy Installation${RESET}"
+    echo -e "${BOLD_GREEN}     📥 Installing MTProto Proxy${RESET}"
     draw_line "$CYAN" "=" 60
     echo ""
     
     # Check existing installation
     if [ -f "/usr/local/bin/mtproto-proxy" ]; then
         print_info "MTProxy is already installed"
-        echo -e -n "👉 ${BOLD_MAGENTA}Do you want to recompile? (y/N): ${RESET}"
-        read recompile
-        if [[ ! "$recompile" =~ ^[Yy]$ ]]; then
-            return 0
-        fi
+        return 0
     fi
     
     # Install dependencies
     print_info "Installing prerequisites..."
     sudo apt update
-    sudo apt install -y git make build-essential libssl-dev zlib1g-dev \
-        zlib1g libssl-dev libevent-dev pkg-config libc-ares-dev \
-        libev-dev libc-ares2 libev4 curl wget tar xxd
+    sudo apt install -y curl wget tar xxd
     
-    # Clone and compile
+    # Detect architecture
+    local cpu_arch=$(uname -m)
+    print_info "Detected architecture: $cpu_arch"
+    
+    # Download precompiled binary based on architecture
+    case "$cpu_arch" in
+        "x86_64")
+            print_info "Downloading x86_64 binary..."
+            sudo curl -L -o /usr/local/bin/mtproto-proxy \
+                "https://github.com/TelegramMessenger/MTProxy/releases/download/v1/objs/bin/mtproto-proxy"
+            ;;
+        "aarch64"|"arm64")
+            print_info "Downloading ARM64 binary..."
+            # Try to find a precompiled ARM binary or compile from source
+            install_mtproxy_from_source
+            return $?
+            ;;
+        *)
+            print_error "Unsupported architecture: $cpu_arch"
+            print_info "Trying to compile from source..."
+            install_mtproxy_from_source
+            return $?
+            ;;
+    esac
+    
+    # Make binary executable
+    sudo chmod +x /usr/local/bin/mtproto-proxy
+    
+    # Verify binary
+    if [ -f "/usr/local/bin/mtproto-proxy" ]; then
+        print_success "MTProxy installed successfully"
+        
+        # Download latest configs
+        print_info "Downloading latest config files..."
+        sudo curl -s --max-time 30 https://core.telegram.org/getProxySecret -o "$CONFIG_DIR/proxy-secret"
+        sudo curl -s --max-time 30 https://core.telegram.org/getProxyConfig -o "$CONFIG_DIR/proxy-multi.conf"
+        
+        # Install stability tweaks
+        install_stability_tweaks
+        
+        return 0
+    else
+        print_error "Failed to install MTProxy"
+        return 1
+    fi
+}
+
+# --- Install MTProxy from Source (ARM Compatible) ---
+install_mtproxy_from_source() {
+    print_info "Compiling MTProxy from source..."
+    
+    # Install compilation dependencies
+    sudo apt install -y git make build-essential libssl-dev zlib1g-dev
+    
+    # Clone repository
     local temp_dir=$(mktemp -d)
     cd "$temp_dir"
     
-    print_info "Downloading source code..."
     git clone https://github.com/TelegramMessenger/MTProxy.git
     cd MTProxy
     
-    # Apply stability patches
-    print_info "Applying stability patches..."
+    # Apply ARM compatibility patches
+    print_info "Applying compatibility patches..."
     
     # Patch 1: Fix PID assertion
     if [ -f "common/pid.c" ]; then
         sed -i 's/assert (!(p & 0xffff0000));/\/\/ assert (!(p \& 0xffff0000));/g' common/pid.c
     fi
     
-    # Patch 2: Increase buffer sizes
-    if [ -f "server/tcp-connection.c" ]; then
-        sed -i 's/#define BUFFER_SIZE .*/#define BUFFER_SIZE 16777216/' server/tcp-connection.c
-    fi
-    
-    # Patch 3: More workers for better performance
-    if [ -f "server/worker.c" ]; then
-        sed -i 's/#define MAX_WORKERS .*/#define MAX_WORKERS 16/' server/worker.c
-    fi
-    
-    # Patch 4: Fix rdtsc function declaration for ARM
-    if [ -f "common/kprintf.h" ]; then
-        if grep -q "static inline long long rdtsc" common/kprintf.h; then
-            print_info "rdtsc function already exists"
-        else
-            echo "static inline long long rdtsc (void) { return 0; }" >> common/kprintf.h
-        fi
-    fi
-    
-    # Check CPU architecture for compilation flags
-    local cpu_arch=$(uname -m)
-    local compile_flags="-O3 -pipe -flto"
-    
-    if [[ "$cpu_arch" == "x86_64" ]]; then
-        compile_flags="$compile_flags -march=native"
-        print_info "Compiling for x86_64 with native optimizations"
-    elif [[ "$cpu_arch" == "aarch64" ]] || [[ "$cpu_arch" == "arm64" ]]; then
-        compile_flags="$compile_flags -mcpu=native"
-        print_info "Compiling for ARM64 (aarch64)"
-        # Disable SSE/SSE2 instructions for ARM
+    # Patch 2: Remove SSE/SSE2 flags for ARM
+    if [ -f "Makefile" ]; then
+        # Remove SSE flags
+        sed -i 's/-march=core2//g' Makefile
+        sed -i 's/-mfpmath=sse//g' Makefile
+        sed -i 's/-mssse3//g' Makefile
         sed -i 's/-msse4.2//g' Makefile
         sed -i 's/-mpclmul//g' Makefile
-    else
-        print_warning "Unknown architecture $cpu_arch, using generic flags"
+        
+        # Add ARM optimization flags
+        local cpu_arch=$(uname -m)
+        if [[ "$cpu_arch" == "aarch64" || "$cpu_arch" == "arm64" ]]; then
+            sed -i 's/CFLAGS = /CFLAGS = -O2 -pipe /' Makefile
+        else
+            sed -i 's/CFLAGS = /CFLAGS = -O2 -pipe /' Makefile
+        fi
     fi
     
-    # Compile with optimizations
-    print_info "Compiling with optimizations..."
+    # Patch 3: Fix ARM-specific issues in source code
+    if [ -f "common/crc32c.c" ]; then
+        # Disable SSE intrinsics for ARM
+        sed -i 's/#ifdef __SSE4_2__/#if 0/' common/crc32c.c
+    fi
     
-    # Show compilation progress
-    echo -e "${YELLOW}Compilation may take 2-5 minutes...${RESET}"
+    # Patch 4: Fix rdtsc for ARM
+    if [ -f "common/kprintf.h" ] && ! grep -q "rdtsc" common/kprintf.h; then
+        echo -e "\nstatic inline long long rdtsc (void) { return 0; }" >> common/kprintf.h
+    fi
     
-    # Run make with specific flags
-    make CFLAGS="$compile_flags" -j$(nproc) 2>&1 | tee /tmp/mtpulse_compile.log || {
-        print_error "Compilation failed. Trying alternative approach..."
-        
-        # Try without optimizations
-        print_info "Trying simpler compilation..."
-        make clean
-        make -j$(nproc) 2>&1 | tee -a /tmp/mtpulse_compile.log
-        
-        if [ ! -f "objs/bin/mtproto-proxy" ]; then
-            print_error "Compilation failed completely"
-            echo -e "${YELLOW}Last 20 lines of log:${RESET}"
-            tail -20 /tmp/mtpulse_compile.log
-            cd "$SCRIPT_DIR"
-            rm -rf "$temp_dir"
-            return 1
-        fi
-    }
+    # Compile
+    print_info "Compiling (this may take a few minutes)..."
+    make -j$(nproc) 2>&1 | tee /tmp/mtpulse_compile.log
     
     if [ ! -f "objs/bin/mtproto-proxy" ]; then
         print_error "Compilation failed"
+        echo -e "${YELLOW}--- Compilation Log ---${RESET}"
+        tail -30 /tmp/mtpulse_compile.log
         cd "$SCRIPT_DIR"
         rm -rf "$temp_dir"
         return 1
@@ -283,22 +304,12 @@ install_mtproxy_enhanced() {
     # Install
     sudo cp objs/bin/mtproto-proxy /usr/local/bin/mtproto-proxy
     sudo chmod +x /usr/local/bin/mtproto-proxy
-    sudo strip /usr/local/bin/mtproto-proxy 2>/dev/null || true
     
     # Cleanup
     cd "$SCRIPT_DIR"
     rm -rf "$temp_dir"
     
-    print_success "MTProxy installed successfully"
-    
-    # Download latest configs
-    print_info "Downloading latest config files..."
-    sudo curl -s --max-time 30 https://core.telegram.org/getProxySecret -o "$CONFIG_DIR/proxy-secret"
-    sudo curl -s --max-time 30 https://core.telegram.org/getProxyConfig -o "$CONFIG_DIR/proxy-multi.conf"
-    
-    # Install stability tweaks
-    install_stability_tweaks
-    
+    print_success "MTProxy compiled and installed successfully"
     return 0
 }
 
@@ -311,6 +322,14 @@ create_proxy() {
     draw_line "$GREEN" "=" 60
     echo ""
     
+    # First check if MTProxy is installed
+    if [ ! -f "/usr/local/bin/mtproto-proxy" ]; then
+        print_error "MTProxy is not installed. Please install it first (Option 1)."
+        echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"
+        read
+        return 1
+    fi
+    
     # Proxy name
     local proxy_name
     while true; do
@@ -318,7 +337,7 @@ create_proxy() {
         read proxy_name
         if [[ "$proxy_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
             # Check if name exists
-            if grep -q "^$proxy_name|" "$PROXY_DB"; then
+            if grep -q "^$proxy_name|" "$PROXY_DB" 2>/dev/null; then
                 print_error "This name is already used"
             else
                 break
@@ -364,17 +383,21 @@ create_proxy() {
     # Get public IP
     local public_ip=$(curl -s --max-time 5 https://api.ipify.org || echo "127.0.0.1")
     
-    # Create enhanced service file
+    # Create enhanced service file (FIXED: removed invalid 'unlimited' values)
     print_info "Creating service..."
     
     local service_file="/etc/systemd/system/mtpulse-$proxy_name.service"
     
     # Build ExecStart command
-    local exec_start="/usr/local/bin/mtproto-proxy -u nobody -p 8888 -H $port -S $secret --aes-pwd $CONFIG_DIR/proxy-secret $CONFIG_DIR/proxy-multi.conf -M 1 --ddos-protection --proxy-tag-refresh-interval 86400 --tcp-fast-open --nat-info $public_ip:$port --verbosity 0"
+    local exec_start="/usr/local/bin/mtproto-proxy -u nobody -p 8888 -H $port -S $secret --aes-pwd $CONFIG_DIR/proxy-secret $CONFIG_DIR/proxy-multi.conf -M 1"
     
+    # Add optional parameters
     if [[ -n "$tag" ]]; then
         exec_start="$exec_start -P $tag"
     fi
+    
+    # Add stability options
+    exec_start="$exec_start --tcp-fast-open --nat-info $public_ip:$port --verbosity 0"
     
     cat <<EOF | sudo tee "$service_file" > /dev/null
 [Unit]
@@ -390,14 +413,10 @@ Group=root
 WorkingDirectory=/tmp
 Environment="UV_THREADPOOL_SIZE=16"
 LimitNOFILE=1048576
-LimitNPROC=unlimited
+LimitNPROC=65536
 LimitCORE=infinity
 OOMScoreAdjust=-100
 Nice=-5
-CPUSchedulingPolicy=rr
-CPUSchedulingPriority=50
-IOSchedulingClass=realtime
-IOSchedulingPriority=0
 
 # Stability directives
 Restart=always
@@ -407,10 +426,6 @@ KillSignal=SIGTERM
 TimeoutStopSec=90
 KillMode=process
 
-# Core dump
-LimitCORE=infinity
-PermissionsStartOnly=true
-
 # Logging
 StandardOutput=append:$LOG_DIR/$proxy_name.log
 StandardError=append:$LOG_DIR/$proxy_name-error.log
@@ -419,8 +434,6 @@ SyslogIdentifier=mtpulse-$proxy_name
 # Main command
 ExecStart=$exec_start
 
-# Health check
-ExecStartPost=/bin/bash -c 'echo "Service started at \$(date)" >> $LOG_DIR/$proxy_name-health.log'
 ExecReload=/bin/kill -HUP \$MAINPID
 
 [Install]
@@ -438,19 +451,13 @@ PORT="$2"
 LOG_DIR="/var/log/mtpulse"
 
 # Check if port is listening
-if ! ss -tln 2>/dev/null | grep -q ":$PORT "; then
+if ss -tln 2>/dev/null | grep -q ":$PORT "; then
+    echo "$(date): Port $PORT is listening" >> "$LOG_DIR/$PROXY_NAME-health.log"
+    exit 0
+else
     echo "$(date): Port $PORT not listening" >> "$LOG_DIR/$PROXY_NAME-health.log"
     exit 1
 fi
-
-# Simple connectivity test
-if ! timeout 5 curl -s "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
-    echo "$(date): Local connectivity test failed" >> "$LOG_DIR/$PROXY_NAME-health.log"
-    exit 1
-fi
-
-echo "$(date): Health check passed" >> "$LOG_DIR/$PROXY_NAME-health.log"
-exit 0
 EOF
     
     sudo chmod +x "$health_script"
@@ -483,8 +490,17 @@ EOF
     sudo systemctl daemon-reload
     sudo systemctl enable "mtpulse-$proxy_name.service"
     sudo systemctl enable "mtpulse-$proxy_name-monitor.timer"
-    sudo systemctl start "mtpulse-$proxy_name.service"
-    sudo systemctl start "mtpulse-$proxy_name-monitor.timer"
+    
+    # Start service
+    if sudo systemctl start "mtpulse-$proxy_name.service"; then
+        print_success "Proxy service started"
+        sudo systemctl start "mtpulse-$proxy_name-monitor.timer"
+    else
+        print_error "Failed to start proxy service"
+        echo -e "${YELLOW}Checking service status...${RESET}"
+        sudo systemctl status "mtpulse-$proxy_name.service" --no-pager -l
+        return 1
+    fi
     
     # Add to database
     add_proxy_to_db "$proxy_name" "$port" "$secret" "$tag"
@@ -597,7 +613,7 @@ show_proxy_details() {
     local proxy_name="$1"
     
     # Get from database
-    local proxy_info=$(grep "^$proxy_name|" "$PROXY_DB")
+    local proxy_info=$(grep "^$proxy_name|" "$PROXY_DB" 2>/dev/null)
     if [ -z "$proxy_info" ]; then
         print_error "Proxy not found"
         return
@@ -1022,7 +1038,6 @@ optimize_system() {
     echo -e "  ${BOLD_CYAN}1)${RESET} ${WHITE}Network Settings${RESET}"
     echo -e "  ${BOLD_CYAN}2)${RESET} ${WHITE}System Settings${RESET}"
     echo -e "  ${BOLD_CYAN}3)${RESET} ${WHITE}Firewall Configuration${RESET}"
-    echo -e "  ${BOLD_CYAN}4)${RESET} ${WHITE}Kernel Optimization${RESET}"
     echo -e "  ${BOLD_CYAN}0)${RESET} ${WHITE}Back${RESET}"
     echo ""
     
@@ -1038,9 +1053,6 @@ optimize_system() {
             ;;
         3)
             configure_firewall
-            ;;
-        4)
-            optimize_kernel
             ;;
         0)
             return
@@ -1083,8 +1095,6 @@ net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_sack = 1
-net.ipv4.tcp_ecn = 2
-net.ipv4.tcp_fack = 1
 EOF
     
     sudo sysctl -p /etc/sysctl.d/98-mtpulse-network.conf
@@ -1094,23 +1104,23 @@ EOF
 optimize_system_settings() {
     print_info "Optimizing system settings..."
     
-    # Increase file limits
+    # Increase file limits (FIXED: removed 'unlimited' values)
     cat <<EOF | sudo tee /etc/security/limits.d/99-mtpulse.conf > /dev/null
 # MTPulse file limits
 * soft nofile 1048576
 * hard nofile 1048576
-* soft nproc unlimited
-* hard nproc unlimited
-* soft memlock unlimited
-* hard memlock unlimited
+* soft nproc 65536
+* hard nproc 65536
+root soft nofile 1048576
+root hard nofile 1048576
 EOF
     
     # Configure systemd for better performance
     cat <<EOF | sudo tee /etc/systemd/system.conf.d/99-mtpulse.conf > /dev/null
 [Manager]
 DefaultLimitNOFILE=1048576
-DefaultLimitNPROC=unlimited
-DefaultLimitMEMLOCK=infinity
+DefaultLimitNPROC=65536
+DefaultTasksMax=65536
 EOF
     
     sudo systemctl daemon-reexec
@@ -1137,27 +1147,6 @@ configure_firewall() {
     else
         print_warning "UFW not found. Please configure firewall manually"
     fi
-}
-
-optimize_kernel() {
-    print_info "Applying kernel optimizations..."
-    
-    cat <<EOF | sudo tee /etc/sysctl.d/97-mtpulse-kernel.conf > /dev/null
-# Kernel optimizations for MTProxy
-vm.swappiness = 10
-vm.vfs_cache_pressure = 50
-vm.dirty_ratio = 10
-vm.dirty_background_ratio = 5
-vm.dirty_expire_centisecs = 3000
-vm.dirty_writeback_centisecs = 500
-kernel.pid_max = 4194304
-kernel.threads-max = 2097152
-kernel.sched_autogroup_enabled = 1
-fs.file-max = 2097152
-EOF
-    
-    sudo sysctl -p /etc/sysctl.d/97-mtpulse-kernel.conf
-    print_success "Kernel optimizations applied"
 }
 
 # --- View Logs ---
@@ -1302,7 +1291,7 @@ main() {
         read choice
         
         case $choice in
-            1) install_mtproxy_enhanced ;;
+            1) install_mtproxy_precompiled ;;
             2) create_proxy ;;
             3) list_proxies; echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"; read ;;
             4) manage_proxy ;;
