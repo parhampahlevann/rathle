@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================================
-# MTPulse v2.1 - Enhanced MTProto Proxy Manager
+# MTPulse v2.2 - Enhanced MTProto Proxy Manager
 # With High Stability and Multi-Proxy Management
 # ============================================================================
 
@@ -26,7 +26,7 @@ CONFIG_DIR="/etc/mtpulse"
 PROXY_DB="$CONFIG_DIR/proxies.db"  # Database of all proxies
 LOG_DIR="/var/log/mtpulse"
 SETUP_MARKER="$CONFIG_DIR/.setup_complete"
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 
 # Error handling
 set -euo pipefail
@@ -170,79 +170,12 @@ EOF
     print_success "Stability tweaks applied"
 }
 
-# --- Precompiled MTProxy Installation (ARM Compatible) ---
-install_mtproxy_precompiled() {
-    clear
-    echo ""
-    draw_line "$CYAN" "=" 60
-    echo -e "${BOLD_GREEN}     📥 Installing MTProto Proxy${RESET}"
-    draw_line "$CYAN" "=" 60
-    echo ""
-    
-    # Check existing installation
-    if [ -f "/usr/local/bin/mtproto-proxy" ]; then
-        print_info "MTProxy is already installed"
-        return 0
-    fi
-    
-    # Install dependencies
-    print_info "Installing prerequisites..."
-    sudo apt update
-    sudo apt install -y curl wget tar xxd
-    
-    # Detect architecture
-    local cpu_arch=$(uname -m)
-    print_info "Detected architecture: $cpu_arch"
-    
-    # Download precompiled binary based on architecture
-    case "$cpu_arch" in
-        "x86_64")
-            print_info "Downloading x86_64 binary..."
-            sudo curl -L -o /usr/local/bin/mtproto-proxy \
-                "https://github.com/TelegramMessenger/MTProxy/releases/download/v1/objs/bin/mtproto-proxy"
-            ;;
-        "aarch64"|"arm64")
-            print_info "Downloading ARM64 binary..."
-            # Try to find a precompiled ARM binary or compile from source
-            install_mtproxy_from_source
-            return $?
-            ;;
-        *)
-            print_error "Unsupported architecture: $cpu_arch"
-            print_info "Trying to compile from source..."
-            install_mtproxy_from_source
-            return $?
-            ;;
-    esac
-    
-    # Make binary executable
-    sudo chmod +x /usr/local/bin/mtproto-proxy
-    
-    # Verify binary
-    if [ -f "/usr/local/bin/mtproto-proxy" ]; then
-        print_success "MTProxy installed successfully"
-        
-        # Download latest configs
-        print_info "Downloading latest config files..."
-        sudo curl -s --max-time 30 https://core.telegram.org/getProxySecret -o "$CONFIG_DIR/proxy-secret"
-        sudo curl -s --max-time 30 https://core.telegram.org/getProxyConfig -o "$CONFIG_DIR/proxy-multi.conf"
-        
-        # Install stability tweaks
-        install_stability_tweaks
-        
-        return 0
-    else
-        print_error "Failed to install MTProxy"
-        return 1
-    fi
-}
-
 # --- Install MTProxy from Source (ARM Compatible) ---
 install_mtproxy_from_source() {
-    print_info "Compiling MTProxy from source..."
+    print_info "Compiling MTProxy from source with ARM compatibility..."
     
     # Install compilation dependencies
-    sudo apt install -y git make build-essential libssl-dev zlib1g-dev
+    sudo apt install -y git make build-essential libssl-dev zlib1g-dev gcc
     
     # Clone repository
     local temp_dir=$(mktemp -d)
@@ -252,53 +185,109 @@ install_mtproxy_from_source() {
     cd MTProxy
     
     # Apply ARM compatibility patches
-    print_info "Applying compatibility patches..."
+    print_info "Applying ARM compatibility patches..."
     
     # Patch 1: Fix PID assertion
     if [ -f "common/pid.c" ]; then
         sed -i 's/assert (!(p & 0xffff0000));/\/\/ assert (!(p \& 0xffff0000));/g' common/pid.c
     fi
     
-    # Patch 2: Remove SSE/SSE2 flags for ARM
+    # Patch 2: Remove ALL SSE/SSE2/SSE3 flags for ARM
     if [ -f "Makefile" ]; then
-        # Remove SSE flags
+        # Remove all SSE and x86 specific flags
         sed -i 's/-march=core2//g' Makefile
         sed -i 's/-mfpmath=sse//g' Makefile
         sed -i 's/-mssse3//g' Makefile
         sed -i 's/-msse4.2//g' Makefile
         sed -i 's/-mpclmul//g' Makefile
+        sed -i 's/-msse2//g' Makefile
+        sed -i 's/-msse//g' Makefile
+        sed -i 's/-msse3//g' Makefile
         
-        # Add ARM optimization flags
+        # Add generic optimization flags for ARM
         local cpu_arch=$(uname -m)
         if [[ "$cpu_arch" == "aarch64" || "$cpu_arch" == "arm64" ]]; then
-            sed -i 's/CFLAGS = /CFLAGS = -O2 -pipe /' Makefile
+            sed -i 's/CFLAGS = /CFLAGS = -O2 -pipe -fno-strict-aliasing -fno-strict-overflow -fwrapv /' Makefile
         else
-            sed -i 's/CFLAGS = /CFLAGS = -O2 -pipe /' Makefile
+            sed -i 's/CFLAGS = /CFLAGS = -O2 -pipe -fno-strict-aliasing -fno-strict-overflow -fwrapv /' Makefile
         fi
     fi
     
-    # Patch 3: Fix ARM-specific issues in source code
+    # Patch 3: COMPLETELY DISABLE SSE intrinsics in crc32c.c for ARM
     if [ -f "common/crc32c.c" ]; then
-        # Disable SSE intrinsics for ARM
-        sed -i 's/#ifdef __SSE4_2__/#if 0/' common/crc32c.c
+        # Create backup
+        cp common/crc32c.c common/crc32c.c.backup
+        
+        # Disable SSE completely by commenting out the problematic function
+        sed -i 's/^#ifdef __SSE4_2__$/#if 0/' common/crc32c.c
+        sed -i 's/^#if defined(__SSE4_2__) \&\& defined(__PCLMUL__)$/#if 0/' common/crc32c.c
+        sed -i 's/^#ifdef __x86_64__$/#if 0/' common/crc32c.c
+        
+        # Also disable any SSE function definitions
+        sed -i 's/^.*__builtin_ia32_pclmulqdq128.*$/\/* SSE disabled for ARM compatibility *\//' common/crc32c.c
+        sed -i 's/^.*_mm_crc32_u64.*$/\/* SSE disabled for ARM compatibility *\//' common/crc32c.c
+        sed -i 's/^.*_mm_crc32_u32.*$/\/* SSE disabled for ARM compatibility *\//' common/crc32c.c
+        sed -i 's/^.*_mm_crc32_u16.*$/\/* SSE disabled for ARM compatibility *\//' common/crc32c.c
+        sed -i 's/^.*_mm_crc32_u8.*$/\/* SSE disabled for ARM compatibility *\//' common/crc32c.c
     fi
     
     # Patch 4: Fix rdtsc for ARM
-    if [ -f "common/kprintf.h" ] && ! grep -q "rdtsc" common/kprintf.h; then
+    if [ -f "common/kprintf.h" ] && ! grep -q "static inline long long rdtsc" common/kprintf.h; then
         echo -e "\nstatic inline long long rdtsc (void) { return 0; }" >> common/kprintf.h
     fi
     
-    # Compile
-    print_info "Compiling (this may take a few minutes)..."
-    make -j$(nproc) 2>&1 | tee /tmp/mtpulse_compile.log
+    # Patch 5: Fix sockaddr casting warnings
+    if [ -f "net/net-tcp-rpc-ext-server.c" ]; then
+        sed -i 's/connect (sockets\[i\], \&addr, sizeof (addr))/connect (sockets\[i\], (struct sockaddr *)\&addr, sizeof (addr))/g' net/net-tcp-rpc-ext-server.c
+        sed -i 's/connect (sockets\[i\], \&addr6, sizeof (addr6))/connect (sockets\[i\], (struct sockaddr *)\&addr6, sizeof (addr6))/g' net/net-tcp-rpc-ext-server.c
+    fi
     
-    if [ ! -f "objs/bin/mtproto-proxy" ]; then
+    # Clean previous builds
+    make clean 2>/dev/null || true
+    
+    # Compile with simplified flags
+    print_info "Compiling MTProxy (this may take 2-3 minutes)..."
+    
+    # Show compilation progress
+    echo -e "${YELLOW}Compilation in progress... Please wait.${RESET}"
+    
+    # Run make with reduced output
+    if make -j$(nproc) > /tmp/mtpulse_compile.log 2>&1; then
+        if [ -f "objs/bin/mtproto-proxy" ]; then
+            print_success "Compilation successful!"
+        else
+            print_error "Compilation completed but binary not found"
+            echo -e "${YELLOW}--- Compilation Log (last 30 lines) ---${RESET}"
+            tail -30 /tmp/mtpulse_compile.log
+            cd "$SCRIPT_DIR"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+    else
         print_error "Compilation failed"
-        echo -e "${YELLOW}--- Compilation Log ---${RESET}"
+        echo -e "${YELLOW}--- Compilation Log (last 30 lines) ---${RESET}"
         tail -30 /tmp/mtpulse_compile.log
-        cd "$SCRIPT_DIR"
-        rm -rf "$temp_dir"
-        return 1
+        
+        # Try alternative compilation method
+        print_info "Trying alternative compilation method..."
+        make clean 2>/dev/null || true
+        
+        # Try with even simpler flags
+        if make CFLAGS="-O2 -pipe" -j$(nproc) > /tmp/mtpulse_compile2.log 2>&1; then
+            if [ -f "objs/bin/mtproto-proxy" ]; then
+                print_success "Alternative compilation successful!"
+            else
+                print_error "Alternative compilation also failed"
+                cd "$SCRIPT_DIR"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+        else
+            print_error "All compilation attempts failed"
+            cd "$SCRIPT_DIR"
+            rm -rf "$temp_dir"
+            return 1
+        fi
     fi
     
     # Install
@@ -311,6 +300,90 @@ install_mtproxy_from_source() {
     
     print_success "MTProxy compiled and installed successfully"
     return 0
+}
+
+# --- Install Precompiled Binary or Compile ---
+install_mtproxy() {
+    clear
+    echo ""
+    draw_line "$CYAN" "=" 60
+    echo -e "${BOLD_GREEN}     📥 Installing MTProto Proxy${RESET}"
+    draw_line "$CYAN" "=" 60
+    echo ""
+    
+    # Check existing installation
+    if [ -f "/usr/local/bin/mtproto-proxy" ]; then
+        print_info "MTProxy is already installed"
+        echo -e -n "👉 ${BOLD_MAGENTA}Do you want to reinstall? (y/N): ${RESET}"
+        read reinstall
+        if [[ ! "$reinstall" =~ ^[Yy]$ ]]; then
+            return 0
+        fi
+    fi
+    
+    # Install dependencies
+    print_info "Installing prerequisites..."
+    sudo apt update
+    sudo apt install -y curl wget tar xxd git make build-essential libssl-dev zlib1g-dev
+    
+    # Try to find precompiled binary first
+    local cpu_arch=$(uname -m)
+    print_info "Detected architecture: $cpu_arch"
+    
+    # Try to download precompiled binary
+    print_info "Looking for precompiled binary..."
+    
+    local download_url=""
+    case "$cpu_arch" in
+        "x86_64")
+            download_url="https://github.com/TelegramMessenger/MTProxy/releases/latest/download/mtproto-proxy"
+            ;;
+        "aarch64"|"arm64")
+            download_url="https://github.com/TelegramMessenger/MTProxy/releases/latest/download/mtproto-proxy-arm64"
+            ;;
+        "armv7l"|"armhf")
+            download_url="https://github.com/TelegramMessenger/MTProxy/releases/latest/download/mtproto-proxy-arm"
+            ;;
+    esac
+    
+    if [ -n "$download_url" ]; then
+        print_info "Downloading precompiled binary..."
+        if sudo curl -L -o /usr/local/bin/mtproto-proxy "$download_url" 2>/dev/null; then
+            sudo chmod +x /usr/local/bin/mtproto-proxy
+            
+            # Test the binary
+            if /usr/local/bin/mtproto-proxy --help 2>&1 | grep -q "MTProto Proxy"; then
+                print_success "Precompiled binary installed successfully"
+            else
+                print_warning "Precompiled binary may be corrupted, trying compilation..."
+                sudo rm -f /usr/local/bin/mtproto-proxy
+                install_mtproxy_from_source
+            fi
+        else
+            print_warning "Failed to download precompiled binary, trying compilation..."
+            install_mtproxy_from_source
+        fi
+    else
+        print_warning "No precompiled binary available for $cpu_arch, compiling from source..."
+        install_mtproxy_from_source
+    fi
+    
+    # If installation succeeded, download configs
+    if [ -f "/usr/local/bin/mtproto-proxy" ]; then
+        # Download latest configs
+        print_info "Downloading latest config files..."
+        sudo mkdir -p "$CONFIG_DIR"
+        sudo curl -s --max-time 30 https://core.telegram.org/getProxySecret -o "$CONFIG_DIR/proxy-secret"
+        sudo curl -s --max-time 30 https://core.telegram.org/getProxyConfig -o "$CONFIG_DIR/proxy-multi.conf"
+        
+        # Install stability tweaks
+        install_stability_tweaks
+        
+        return 0
+    else
+        print_error "MTProxy installation failed"
+        return 1
+    fi
 }
 
 # --- Create Proxy with Stability Features ---
@@ -333,7 +406,7 @@ create_proxy() {
     # Proxy name
     local proxy_name
     while true; do
-        echo -e -n "👉 ${BOLD_MAGENTA}Proxy name (letters and numbers only): ${RESET}"
+        echo -e -n "👉 ${BOLD_MAGENTA}Proxy name (letters, numbers, - and _ only): ${RESET}"
         read proxy_name
         if [[ "$proxy_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
             # Check if name exists
@@ -343,7 +416,7 @@ create_proxy() {
                 break
             fi
         else
-            print_error "Invalid name"
+            print_error "Invalid name. Use only letters, numbers, - and _"
         fi
     done
     
@@ -363,7 +436,7 @@ create_proxy() {
                 break
             fi
         else
-            print_error "Invalid port"
+            print_error "Invalid port. Must be 1-65535"
         fi
     done
     
@@ -383,7 +456,7 @@ create_proxy() {
     # Get public IP
     local public_ip=$(curl -s --max-time 5 https://api.ipify.org || echo "127.0.0.1")
     
-    # Create enhanced service file (FIXED: removed invalid 'unlimited' values)
+    # Create enhanced service file
     print_info "Creating service..."
     
     local service_file="/etc/systemd/system/mtpulse-$proxy_name.service"
@@ -408,8 +481,8 @@ StartLimitBurst=5
 
 [Service]
 Type=exec
-User=root
-Group=root
+User=nobody
+Group=nogroup
 WorkingDirectory=/tmp
 Environment="UV_THREADPOOL_SIZE=16"
 LimitNOFILE=1048576
@@ -492,6 +565,7 @@ EOF
     sudo systemctl enable "mtpulse-$proxy_name-monitor.timer"
     
     # Start service
+    print_info "Starting proxy service..."
     if sudo systemctl start "mtpulse-$proxy_name.service"; then
         print_success "Proxy service started"
         sudo systemctl start "mtpulse-$proxy_name-monitor.timer"
@@ -499,6 +573,8 @@ EOF
         print_error "Failed to start proxy service"
         echo -e "${YELLOW}Checking service status...${RESET}"
         sudo systemctl status "mtpulse-$proxy_name.service" --no-pager -l
+        echo -e "${YELLOW}Checking binary permissions...${RESET}"
+        ls -la /usr/local/bin/mtproto-proxy
         return 1
     fi
     
@@ -528,6 +604,102 @@ EOF
     draw_line "$CYAN" "-" 60
     echo -e "${YELLOW}📊 Service Status:${RESET}"
     sudo systemctl status "mtpulse-$proxy_name.service" --no-pager -l | head -20
+    echo ""
+    
+    echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"
+    read
+}
+
+# --- Complete Uninstall ---
+complete_uninstall() {
+    clear
+    echo ""
+    draw_line "$RED" "=" 60
+    echo -e "${BOLD_RED}     🗑️  Complete Uninstall MTPulse${RESET}"
+    draw_line "$RED" "=" 60
+    echo ""
+    
+    echo -e "${RED}⚠️  ⚠️  ⚠️  WARNING: This will remove ALL MTPulse components!${RESET}"
+    echo ""
+    echo -e "This will remove:"
+    echo -e "  ${RED}•${RESET} All MTProxy services and timers"
+    echo -e "  ${RED}•${RESET} All proxy configurations"
+    echo -e "  ${RED}•${RESET} MTPulse database and logs"
+    echo -e "  ${RED}•${RESET} MTProxy binary"
+    echo -e "  ${RED}•${RESET} All configuration files"
+    echo ""
+    
+    echo -e -n "👉 ${BOLD_MAGENTA}Are you ABSOLUTELY sure? Type 'DELETE' to confirm: ${RESET}"
+    read confirmation
+    
+    if [ "$confirmation" != "DELETE" ]; then
+        print_info "Uninstall cancelled"
+        echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"
+        read
+        return
+    fi
+    
+    print_info "Starting complete uninstall..."
+    
+    # Step 1: Stop and remove all proxy services
+    print_info "Stopping all proxy services..."
+    
+    if [ -f "$PROXY_DB" ]; then
+        while IFS='|' read -r name port secret tag status created_at last_check; do
+            [[ "$name" =~ ^# ]] && continue
+            
+            sudo systemctl stop "mtpulse-$name.service" 2>/dev/null || true
+            sudo systemctl stop "mtpulse-$name-monitor.timer" 2>/dev/null || true
+            sudo systemctl disable "mtpulse-$name.service" 2>/dev/null || true
+            sudo systemctl disable "mtpulse-$name-monitor.timer" 2>/dev/null || true
+            sudo systemctl disable "mtpulse-$name-monitor.service" 2>/dev/null || true
+            
+            sudo rm -f "/etc/systemd/system/mtpulse-$name.service"
+            sudo rm -f "/etc/systemd/system/mtpulse-$name-monitor.timer"
+            sudo rm -f "/etc/systemd/system/mtpulse-$name-monitor.service"
+            
+            print_success "Removed service for $name"
+        done < "$PROXY_DB"
+    fi
+    
+    # Step 2: Remove MTProxy binary
+    print_info "Removing MTProxy binary..."
+    sudo rm -f /usr/local/bin/mtproto-proxy
+    
+    # Step 3: Remove all configuration files
+    print_info "Removing configuration files..."
+    sudo rm -rf "$CONFIG_DIR"
+    
+    # Step 4: Remove logs
+    print_info "Removing logs..."
+    sudo rm -rf "$LOG_DIR"
+    
+    # Step 5: Remove systemd configs
+    print_info "Removing systemd configurations..."
+    sudo rm -f /etc/sysctl.d/99-mtpulse.conf
+    sudo rm -f /etc/logrotate.d/mtpulse
+    sudo rm -f /etc/security/limits.d/99-mtpulse.conf
+    sudo rm -f /etc/systemd/system.conf.d/99-mtpulse.conf
+    sudo rm -f /etc/sysctl.d/98-mtpulse-network.conf
+    sudo rm -f /etc/sysctl.d/97-mtpulse-kernel.conf
+    
+    # Step 6: Reload systemd
+    sudo systemctl daemon-reload
+    
+    # Step 7: Apply original sysctl settings
+    print_info "Restoring network settings..."
+    sudo sysctl -p 2>/dev/null || true
+    
+    # Step 8: Clean up any leftover source directories
+    print_info "Cleaning up source directories..."
+    if [ -d "MTProxy" ]; then
+        rm -rf MTProxy
+    fi
+    
+    print_success "✅ MTPulse completely uninstalled!"
+    echo ""
+    echo -e "${YELLOW}All MTPulse components have been removed from your system.${RESET}"
+    echo -e "${YELLOW}You can now reinstall fresh if needed.${RESET}"
     echo ""
     
     echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"
@@ -1104,7 +1276,7 @@ EOF
 optimize_system_settings() {
     print_info "Optimizing system settings..."
     
-    # Increase file limits (FIXED: removed 'unlimited' values)
+    # Increase file limits
     cat <<EOF | sudo tee /etc/security/limits.d/99-mtpulse.conf > /dev/null
 # MTPulse file limits
 * soft nofile 1048576
@@ -1255,6 +1427,7 @@ EOF
     echo -e "  ${BOLD_CYAN}7)${RESET} ${WHITE}Backup / Restore${RESET}"
     echo -e "  ${BOLD_CYAN}8)${RESET} ${WHITE}System Optimization${RESET}"
     echo -e "  ${BOLD_CYAN}9)${RESET} ${WHITE}View Logs${RESET}"
+    echo -e "  ${BOLD_CYAN}10)${RESET} ${RED}Complete Uninstall${RESET}"
     echo -e "  ${BOLD_CYAN}0)${RESET} ${WHITE}Exit${RESET}"
     echo ""
     draw_line "$CYAN" "-" 60
@@ -1291,7 +1464,7 @@ main() {
         read choice
         
         case $choice in
-            1) install_mtproxy_precompiled ;;
+            1) install_mtproxy ;;
             2) create_proxy ;;
             3) list_proxies; echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"; read ;;
             4) manage_proxy ;;
@@ -1300,6 +1473,7 @@ main() {
             7) backup_all_proxies ;;
             8) optimize_system ;;
             9) view_logs ;;
+            10) complete_uninstall ;;
             0) 
                 echo -e "${GREEN}Exiting...${RESET}"
                 exit 0
