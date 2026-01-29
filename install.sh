@@ -1,723 +1,1249 @@
-#!/usr/bin/env bash
-set -e
+#!/bin/bash
 
-### ===== Colors =====
+# ============================================================================
+# MTPulse v2.0 - Enhanced MTProto Proxy Manager
+# With High Stability and Multi-Proxy Management
+# ============================================================================
+
+# Define colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
+YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[0;37m'
+RESET='\033[0m'
+BOLD_GREEN='\033[1;32m'
+BOLD_RED='\033[1;31m'
+BOLD_CYAN='\033[1;36m'
+BOLD_YELLOW='\033[1;33m'
+BOLD_MAGENTA='\033[1;35m'
 
-### ===== CONFIG =====
-BIN="/usr/local/bin/mtg"
-CONF_DIR="/etc/mtg"
-CONF="$CONF_DIR/config.toml"
-SERVICE="/etc/systemd/system/mtg.service"
-LOG_FILE="/var/log/mtg.log"
+# Global Paths
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="/etc/mtpulse"
+PROXY_DB="$CONFIG_DIR/proxies.db"  # Database of all proxies
+LOG_DIR="/var/log/mtpulse"
+SETUP_MARKER="$CONFIG_DIR/.setup_complete"
+SCRIPT_VERSION="2.0.0"
 
-### ===== FUNCTIONS =====
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}Error: Run with sudo${NC}"
-        exit 1
+# Error handling
+set -euo pipefail
+trap 'handle_error $LINENO' ERR
+
+handle_error() {
+    local line=$1
+    echo -e "${RED}❌ Error occurred at line $line${RESET}"
+    exit 1
+}
+
+# --- Helper Functions ---
+print_success() { echo -e "${GREEN}✅ $1${RESET}"; }
+print_error() { echo -e "${RED}❌ $1${RESET}"; }
+print_info() { echo -e "${CYAN}ℹ️  $1${RESET}"; }
+print_warning() { echo -e "${YELLOW}⚠️  $1${RESET}"; }
+
+draw_line() {
+    local color="$1"
+    local char="${2:-=}"
+    local length="${3:-60}"
+    printf "${color}"
+    printf "%${length}s" | tr " " "$char"
+    printf "${RESET}\n"
+}
+
+# --- Database Functions (For Storing Proxies) ---
+init_database() {
+    sudo mkdir -p "$CONFIG_DIR" "$LOG_DIR"
+    
+    if [ ! -f "$PROXY_DB" ]; then
+        sudo cat > "$PROXY_DB" <<EOF
+# MTPulse Proxies Database
+# Format: NAME|PORT|SECRET|TAG|STATUS|CREATED_AT|LAST_CHECK
+EOF
+        sudo chmod 600 "$PROXY_DB"
     fi
 }
 
-show_banner() {
-    clear
-    echo -e "${BLUE}"
-    echo "┌──────────────────────────────────────────┐"
-    echo "│         MTG Proxy Installer              │"
-    echo "└──────────────────────────────────────────┘"
-    echo -e "${NC}"
+add_proxy_to_db() {
+    local name="$1"
+    local port="$2"
+    local secret="$3"
+    local tag="${4:-}"
+    local created_at=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    echo "$name|$port|$secret|$tag|ACTIVE|$created_at|$created_at" | sudo tee -a "$PROXY_DB" > /dev/null
+    print_success "Proxy $name added to database"
 }
 
-check_port() {
-    local port=$1
-    echo -e "${YELLOW}[*] Checking port $port...${NC}"
-    
-    if command -v ss &> /dev/null; then
-        if ss -tuln | grep -q ":$port "; then
-            echo -e "${RED}Error: Port $port is in use!${NC}"
-            ss -tuln | grep ":$port" || true
-            return 1
-        fi
-    elif command -v netstat &> /dev/null; then
-        if netstat -tuln | grep -q ":$port "; then
-            echo -e "${RED}Error: Port $port is in use!${NC}"
-            return 1
-        fi
+remove_proxy_from_db() {
+    local name="$1"
+    sudo sed -i "/^$name|/d" "$PROXY_DB"
+    print_success "Proxy $name removed from database"
+}
+
+list_proxies() {
+    if [ ! -s "$PROXY_DB" ]; then
+        print_warning "No proxies registered"
+        return 1
     fi
     
-    echo -e "${GREEN}[+] Port $port is available${NC}"
+    echo -e "${BOLD_CYAN}┌─────────────────────────────────────────────────────────────┐${RESET}"
+    echo -e "${BOLD_CYAN}│                    Active Proxies List                      │${RESET}"
+    echo -e "${BOLD_CYAN}├──────────┬──────┬──────────────────────────────┬─────────────┤${RESET}"
+    echo -e "${BOLD_CYAN}│   Name   │ Port │           Status            │ Created Date │${RESET}"
+    echo -e "${BOLD_CYAN}├──────────┼──────┼──────────────────────────────┼─────────────┤${RESET}"
+    
+    local count=0
+    while IFS='|' read -r name port secret tag status created_at last_check; do
+        # Skip comment lines
+        [[ "$name" =~ ^# ]] && continue
+        
+        local status_color=$GREEN
+        [[ "$status" != "ACTIVE" ]] && status_color=$RED
+        
+        # Check if service is actually running
+        if systemctl is-active --quiet "mtpulse-$name"; then
+            status_color=$GREEN
+            status="✅ Active"
+        else
+            status_color=$RED
+            status="❌ Inactive"
+        fi
+        
+        printf "${WHITE}│ %-8s │ %-4s │ ${status_color}%-26s${WHITE} │ %-11s │\n" \
+            "$name" "$port" "$status" "$created_at"
+        ((count++))
+    done < "$PROXY_DB"
+    
+    echo -e "${BOLD_CYAN}└──────────┴──────┴──────────────────────────────┴─────────────┘${RESET}"
+    echo -e "Total Proxies: ${BOLD_GREEN}$count${RESET}"
     return 0
 }
 
-get_public_ip() {
-    echo -e "${YELLOW}[*] Getting public IP...${NC}"
+# --- Stability Improvements ---
+install_stability_tweaks() {
+    print_info "Installing stability tweaks..."
     
-    # Try multiple services
-    local services=(
-        "https://api.ipify.org"
-        "https://icanhazip.com"
-        "https://ifconfig.me/ip"
-        "https://checkip.amazonaws.com"
-        "https://ipinfo.io/ip"
-        "http://whatismyip.akamai.com"
-    )
+    # Increase system limits
+    cat <<EOF | sudo tee /etc/sysctl.d/99-mtpulse.conf > /dev/null
+# MTPulse Stability Tweaks
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 65536
+net.core.wmem_default = 65536
+net.core.netdev_max_backlog = 4096
+net.core.somaxconn = 4096
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_max_syn_backlog = 4096
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_intvl = 15
+EOF
     
-    for service in "${services[@]}"; do
-        echo -ne "${YELLOW}   Trying $service...${NC} "
-        IP=$(timeout 5 curl -s -4 "$service" 2>/dev/null | tr -d '\n\r')
-        if [[ -n "$IP" && "$IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo -e "${GREEN}$IP${NC}"
+    sudo sysctl -p /etc/sysctl.d/99-mtpulse.conf
+    
+    # Create logrotate for better log management
+    cat <<EOF | sudo tee /etc/logrotate.d/mtpulse > /dev/null
+/var/log/mtpulse/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 640 root adm
+    sharedscripts
+    postrotate
+        systemctl reload mtpulse-* 2>/dev/null || true
+    endscript
+}
+EOF
+    
+    print_success "Stability tweaks applied"
+}
+
+# --- Enhanced MTProxy Installation ---
+install_mtproxy_enhanced() {
+    clear
+    echo ""
+    draw_line "$CYAN" "=" 60
+    echo -e "${BOLD_GREEN}     📥 Enhanced MTProto Proxy Installation${RESET}"
+    draw_line "$CYAN" "=" 60
+    echo ""
+    
+    # Check existing installation
+    if [ -f "/usr/local/bin/mtproto-proxy" ]; then
+        print_info "MTProxy is already installed"
+        echo -e -n "👉 ${BOLD_MAGENTA}Do you want to recompile? (y/N): ${RESET}"
+        read recompile
+        if [[ ! "$recompile" =~ ^[Yy]$ ]]; then
             return 0
         fi
-        echo -e "${RED}failed${NC}"
-        sleep 1
-    done
-    
-    # Get local IP as fallback
-    IP=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "YOUR_SERVER_IP")
-    echo -e "${YELLOW}[!] Using local IP: $IP${NC}"
-    return 1
-}
-
-install_deps() {
-    echo -e "${YELLOW}[*] Updating system packages...${NC}"
-    apt-get update -y || yum update -y || dnf update -y || true
-    
-    echo -e "${YELLOW}[*] Installing dependencies...${NC}"
-    
-    # Detect package manager
-    if command -v apt-get &> /dev/null; then
-        apt-get install -y curl wget net-tools iproute2 jq ca-certificates \
-                           openssl coreutils build-essential 2>/dev/null || true
-    elif command -v yum &> /dev/null; then
-        yum install -y curl wget net-tools iproute jq ca-certificates \
-                       openssl coreutils gcc make 2>/dev/null || true
-    elif command -v dnf &> /dev/null; then
-        dnf install -y curl wget net-tools iproute jq ca-certificates \
-                       openssl coreutils gcc make 2>/dev/null || true
-    else
-        echo -e "${RED}[!] Cannot detect package manager${NC}"
-    fi
-}
-
-configure_firewall() {
-    local port=$1
-    echo -e "${YELLOW}[*] Configuring firewall for port $port...${NC}"
-    
-    # Check current firewall rules
-    if command -v ufw &> /dev/null; then
-        echo -e "${YELLOW}   Configuring UFW...${NC}"
-        ufw --force enable 2>/dev/null || true
-        ufw allow "$port"/tcp comment "MTG Proxy"
-        ufw allow 22/tcp comment "SSH"
-        echo -e "${GREEN}[+] UFW configured${NC}"
-    elif command -v firewall-cmd &> /dev/null; then
-        echo -e "${YELLOW}   Configuring firewalld...${NC}"
-        firewall-cmd --permanent --add-port="$port"/tcp
-        firewall-cmd --permanent --add-port=22/tcp
-        firewall-cmd --reload
-        echo -e "${GREEN}[+] Firewalld configured${NC}"
-    elif command -v iptables &> /dev/null; then
-        echo -e "${YELLOW}   Configuring iptables...${NC}"
-        iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
-        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-        echo -e "${GREEN}[+] iptables configured${NC}"
-    else
-        echo -e "${YELLOW}[!] No firewall manager found, skipping${NC}"
-    fi
-}
-
-configure_bbr() {
-    echo -e "${YELLOW}[*] Optimizing network settings...${NC}"
-    
-    # Check if BBR is available
-    if modprobe tcp_bbr 2>/dev/null; then
-        cat > /etc/sysctl.d/99-mtg-optimize.conf <<'EOF'
-# BBR TCP Congestion Control
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# Network performance
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
-
-# Connection management
-net.core.netdev_max_backlog = 250000
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_slow_start_after_idle = 0
-
-# Timeouts
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_intvl = 60
-net.ipv4.tcp_keepalive_probes = 5
-EOF
-        sysctl -p /etc/sysctl.d/99-mtg-optimize.conf 2>/dev/null
-        echo -e "${GREEN}[+] BBR enabled${NC}"
-    else
-        echo -e "${YELLOW}[!] BBR not available, using default TCP${NC}"
-    fi
-}
-
-download_mtg_binary() {
-    echo -e "${YELLOW}[*] Downloading MTG binary...${NC}"
-    
-    # Detect architecture
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64) 
-            ARCH_TYPE="amd64"
-            ARCH_ALT="x86_64"
-            ;;
-        aarch64|arm64) 
-            ARCH_TYPE="arm64"
-            ARCH_ALT="aarch64"
-            ;;
-        armv7l|armv8l) 
-            ARCH_TYPE="armv7"
-            ARCH_ALT="arm"
-            ;;
-        *) 
-            echo -e "${RED}Error: Unsupported architecture: $ARCH${NC}"
-            echo -e "${YELLOW}Supported: x86_64, aarch64, armv7l${NC}"
-            exit 1
-            ;;
-    esac
-    
-    echo -e "${YELLOW}   Architecture detected: $ARCH ($ARCH_TYPE)${NC}"
-    
-    # Multiple download URLs (mirrors)
-    local urls=(
-        "https://github.com/9seconds/mtg/releases/latest/download/mtg-linux-$ARCH_TYPE"
-        "https://github.com/9seconds/mtg/releases/latest/download/mtg-$ARCH_TYPE"
-        "https://github.com/9seconds/mtg/releases/latest/download/mtg"
-        "https://dl.mtgproxy.org/mtg-linux-$ARCH_TYPE"
-    )
-    
-    # Try to get latest version from GitHub API
-    echo -e "${YELLOW}   Fetching latest version info...${NC}"
-    LATEST_TAG=$(curl -s https://api.github.com/repos/9seconds/mtg/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' 2>/dev/null || echo "v2.1.7")
-    
-    if [[ -n "$LATEST_TAG" ]]; then
-        urls+=(
-            "https://github.com/9seconds/mtg/releases/download/$LATEST_TAG/mtg-linux-$ARCH_TYPE"
-            "https://github.com/9seconds/mtg/releases/download/$LATEST_TAG/mtg-$ARCH_TYPE"
-        )
     fi
     
-    echo -e "${YELLOW}   Latest version: ${LATEST_TAG:-unknown}${NC}"
+    # Install dependencies
+    print_info "Installing prerequisites..."
+    sudo apt update
+    sudo apt install -y git make build-essential libssl-dev zlib1g-dev \
+        zlib1g libssl-dev libevent-dev pkg-config libc-ares-dev \
+        libev-dev libc-ares2 libev4 curl wget tar xxd
     
-    # Try each URL
-    local downloaded=false
+    # Clone and compile
+    local temp_dir=$(mktemp -d)
+    cd "$temp_dir"
     
-    for i in "${!urls[@]}"; do
-        url="${urls[$i]}"
-        echo -ne "${YELLOW}   Trying source $((i+1))/${#urls[@]}: $url...${NC} "
-        
-        # Download with timeout and retry
-        if wget --timeout=20 --tries=2 -q -O "$BIN.tmp" "$url" 2>/dev/null || \
-           curl -s -L --max-time 20 --retry 2 -o "$BIN.tmp" "$url" 2>/dev/null; then
-            
-            # Check if file is not empty
-            if [[ -s "$BIN.tmp" ]]; then
-                mv "$BIN.tmp" "$BIN"
-                chmod +x "$BIN"
-                echo -e "${GREEN}success${NC}"
-                
-                # Verify binary works
-                if "$BIN" --version &>/dev/null || "$BIN" -h &>/dev/null; then
-                    echo -e "${GREEN}[+] Binary verified${NC}"
-                    downloaded=true
-                    break
-                else
-                    echo -e "${YELLOW}   Binary verification failed, trying next...${NC}"
-                    rm -f "$BIN"
-                fi
+    print_info "Downloading source code..."
+    git clone https://github.com/TelegramMessenger/MTProxy.git
+    cd MTProxy
+    
+    # Apply stability patches
+    print_info "Applying stability patches..."
+    
+    # Patch 1: Fix PID assertion
+    if [ -f "common/pid.c" ]; then
+        sed -i 's/assert (!(p & 0xffff0000));/\/\/ assert (!(p \& 0xffff0000));/g' common/pid.c
+    fi
+    
+    # Patch 2: Increase buffer sizes
+    if [ -f "server/tcp-connection.c" ]; then
+        sed -i 's/#define BUFFER_SIZE .*/#define BUFFER_SIZE 16777216/' server/tcp-connection.c
+    fi
+    
+    # Patch 3: More workers for better performance
+    if [ -f "server/worker.c" ]; then
+        sed -i 's/#define MAX_WORKERS .*/#define MAX_WORKERS 16/' server/worker.c
+    fi
+    
+    # Compile with optimizations
+    print_info "Compiling with optimizations..."
+    make CFLAGS="-O3 -march=native -pipe -flto" -j$(nproc)
+    
+    if [ ! -f "objs/bin/mtproto-proxy" ]; then
+        print_error "Compilation failed"
+        cd "$SCRIPT_DIR"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # Install
+    sudo cp objs/bin/mtproto-proxy /usr/local/bin/mtproto-proxy
+    sudo chmod +x /usr/local/bin/mtproto-proxy
+    sudo strip /usr/local/bin/mtproto-proxy
+    
+    # Cleanup
+    cd "$SCRIPT_DIR"
+    rm -rf "$temp_dir"
+    
+    print_success "MTProxy installed successfully"
+    
+    # Download latest configs
+    print_info "Downloading latest config files..."
+    sudo curl -s --max-time 30 https://core.telegram.org/getProxySecret -o "$CONFIG_DIR/proxy-secret"
+    sudo curl -s --max-time 30 https://core.telegram.org/getProxyConfig" -o "$CONFIG_DIR/proxy-multi.conf"
+    
+    # Install stability tweaks
+    install_stability_tweaks
+    
+    return 0
+}
+
+# --- Create Proxy with Stability Features ---
+create_proxy() {
+    clear
+    echo ""
+    draw_line "$GREEN" "=" 60
+    echo -e "${BOLD_GREEN}     🚀 Create New Proxy${RESET}"
+    draw_line "$GREEN" "=" 60
+    echo ""
+    
+    # Proxy name
+    local proxy_name
+    while true; do
+        echo -e -n "👉 ${BOLD_MAGENTA}Proxy name (letters and numbers only): ${RESET}"
+        read proxy_name
+        if [[ "$proxy_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            # Check if name exists
+            if grep -q "^$proxy_name|" "$PROXY_DB"; then
+                print_error "This name is already used"
             else
-                echo -e "${RED}empty file${NC}"
-                rm -f "$BIN.tmp"
+                break
             fi
         else
-            echo -e "${RED}failed${NC}"
+            print_error "Invalid name"
         fi
     done
     
-    # Fallback: Build from source if download fails
-    if [[ "$downloaded" == false ]]; then
-        echo -e "${YELLOW}[!] All downloads failed, trying to install from package manager...${NC}"
+    # Port
+    local port
+    while true; do
+        echo -e -n "👉 ${BOLD_MAGENTA}Port (default 443): ${RESET}"
+        read port
+        port=${port:-443}
         
-        # Try to install from package manager
-        if command -v apt-get &> /dev/null; then
-            echo -e "${YELLOW}   Trying to install via apt...${NC}"
-            apt-get install -y mtg 2>/dev/null || true
-        fi
-        
-        # Check if binary exists now
-        if command -v mtg &> /dev/null; then
-            BIN=$(command -v mtg)
-            echo -e "${GREEN}[+] MTG installed from package manager${NC}"
+        # Validate port
+        if [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
+            # Check port availability
+            if ss -tuln | grep -q ":$port "; then
+                print_error "Port $port is already in use"
+            else
+                break
+            fi
         else
-            echo -e "${RED}Error: Cannot download or install MTG binary${NC}"
-            echo -e "${YELLOW}Manual steps:${NC}"
-            echo "1. Download manually from: https://github.com/9seconds/mtg/releases"
-            echo "2. Copy to /usr/local/bin/mtg"
-            echo "3. Run: chmod +x /usr/local/bin/mtg"
-            exit 1
+            print_error "Invalid port"
         fi
-    fi
+    done
     
-    # Final verification
-    if [[ -f "$BIN" ]]; then
-        FILESIZE=$(stat -c%s "$BIN" 2>/dev/null || wc -c < "$BIN")
-        echo -e "${GREEN}[+] Binary downloaded: $BIN (${FILESIZE} bytes)${NC}"
-    else
-        echo -e "${RED}Error: Binary not found after installation${NC}"
-        exit 1
-    fi
-}
-
-generate_secret() {
-    echo -e "${YELLOW}[*] Generating secure secret...${NC}"
+    # Generate strong secret
+    local secret=$(openssl rand -hex 16)
+    echo -e "Secret: ${WHITE}$secret${RESET}"
     
-    # Try different methods to generate random secret
-    if command -v openssl &> /dev/null; then
-        SECRET=$(openssl rand -hex 16)
-    elif [[ -f /dev/urandom ]]; then
-        SECRET=$(head -c 32 /dev/urandom | base64 | tr -d '+/=' | head -c 32)
-    else
-        # Fallback to date + random
-        SECRET=$(date +%s%N | sha256sum | head -c 32)
-    fi
+    # AD Tag (optional)
+    local tag=""
+    echo -e -n "👉 ${BOLD_MAGENTA}AD Tag (optional, press Enter to skip): ${RESET}"
+    read tag
     
-    # MTG requires secret to start with "dd" or "ee"
-    echo "ee$SECRET"
-}
-
-create_config() {
-    local port=$1
-    echo -e "${YELLOW}[*] Creating configuration...${NC}"
+    # Create proxy directory
+    local proxy_dir="$CONFIG_DIR/proxies/$proxy_name"
+    sudo mkdir -p "$proxy_dir"
     
-    # Create config directory
-    mkdir -p "$CONF_DIR"
+    # Create enhanced service file
+    print_info "Creating service..."
     
-    # Generate secret
-    SECRET=$(generate_secret)
-    
-    # Create config file
-    cat > "$CONF" <<EOF
-# MTG Proxy Configuration
-# Generated on $(date)
-
-# Server binding
-bind = "0.0.0.0:$port"
-
-# Secret for Telegram connection
-secret = "$SECRET"
-
-# Number of worker processes (0 = auto)
-workers = 2
-
-# Stats server (for monitoring)
-stats-bind = "127.0.0.1:8080"
-
-# Domain fronting only
-dd-only = true
-
-# Time synchronization tolerance
-clock-skew = "2s"
-
-# TCP Fast Open
-tcp-fast-open = true
-
-# Buffer size
-tcp-buffer = "64kb"
-
-# Domain for domain fronting
-fake-tls = "www.google.com"
-EOF
-    
-    echo -e "${GREEN}[+] Configuration created: $CONF${NC}"
-    echo -e "${YELLOW}   Secret: ${SECRET:0:20}...${NC}"
-    
-    # Return secret for display
-    echo "$SECRET"
-}
-
-create_systemd_service() {
-    echo -e "${YELLOW}[*] Creating systemd service...${NC}"
-    
-    # Create log directory
-    mkdir -p /var/log/
-    
-    # Create service file
-    cat > "$SERVICE" <<EOF
+    local service_file="/etc/systemd/system/mtpulse-$proxy_name.service"
+    cat <<EOF | sudo tee "$service_file" > /dev/null
 [Unit]
-Description=MTG MTProto Proxy
+Description=MTPulse Proxy - $proxy_name (Port: $port)
 After=network.target
-Wants=network-online.target
 StartLimitIntervalSec=500
 StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=exec
 User=root
-WorkingDirectory=/etc/mtg
-ExecStart=$BIN run $CONF
-ExecReload=/bin/kill -HUP \$MAINPID
-Restart=always
-RestartSec=5
-TimeoutStopSec=30
-StandardOutput=append:$LOG_FILE
-StandardError=append:$LOG_FILE
-SyslogIdentifier=mtg
-LimitNOFILE=infinity
+Group=root
+WorkingDirectory=/tmp
+Environment="UV_THREADPOOL_SIZE=16"
+LimitNOFILE=1048576
+LimitNPROC=unlimited
+LimitCORE=infinity
+OOMScoreAdjust=-100
+Nice=-5
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=50
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
 
-# Security
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
+# Stability directives
+Restart=always
+RestartSec=10
+StartLimitInterval=0
+KillSignal=SIGTERM
+TimeoutStopSec=90
+KillMode=process
+
+# Core dump
+LimitCORE=infinity
+PermissionsStartOnly=true
+
+# Logging
+StandardOutput=append:$LOG_DIR/$proxy_name.log
+StandardError=append:$LOG_DIR/$proxy_name-error.log
+SyslogIdentifier=mtpulse-$proxy_name
+
+# Main command
+ExecStart=/usr/local/bin/mtproto-proxy \
+  -u nobody \
+  -p 8888 \
+  -H $port \
+  -S $secret \
+  --aes-pwd $CONFIG_DIR/proxy-secret \
+  $CONFIG_DIR/proxy-multi.conf \
+  -M 1 \
+  --ddos-protection \
+  --proxy-tag-refresh-interval 86400 \
+  --tcp-fast-open \
+  ${tag:+-P $tag} \
+  --nat-info $(curl -s https://api.ipify.org):$port \
+  --verbosity 0
+
+# Health check
+ExecStartPost=/bin/bash -c 'echo "Service started at \$(date)" >> $LOG_DIR/$proxy_name-health.log'
+ExecReload=/bin/kill -HUP \$MAINPID
 
 [Install]
 WantedBy=multi-user.target
 EOF
     
-    # Create log file
-    touch "$LOG_FILE"
-    chmod 644 "$LOG_FILE"
-    
-    # Reload systemd and enable service
-    systemctl daemon-reload
-    systemctl enable mtg
-    
-    echo -e "${GREEN}[+] Systemd service created${NC}"
-}
+    # Create health check script
+    local health_script="$proxy_dir/health-check.sh"
+    cat <<EOF | sudo tee "$health_script" > /dev/null
+#!/bin/bash
+# Health check for proxy $proxy_name
+PORT=$port
+SECRET="$secret"
+PROXY_NAME="$proxy_name"
 
-start_mtg_service() {
-    echo -e "${YELLOW}[*] Starting MTG service...${NC}"
-    
-    # Stop if already running
-    systemctl stop mtg 2>/dev/null || true
-    pkill -9 mtg 2>/dev/null || true
-    
-    # Wait a bit
-    sleep 2
-    
-    # Start service
-    if systemctl start mtg; then
-        echo -e "${GREEN}[+] Service started${NC}"
-    else
-        echo -e "${RED}[!] Failed to start service${NC}"
-        return 1
-    fi
-    
-    # Wait and check status
-    echo -e "${YELLOW}[*] Checking service status...${NC}"
-    sleep 3
-    
-    if systemctl is-active --quiet mtg; then
-        echo -e "${GREEN}[✅] Service is running${NC}"
-        
-        # Check if listening on port
-        local attempts=0
-        while [[ $attempts -lt 10 ]]; do
-            if ss -tuln 2>/dev/null | grep -q ":$PORT "; then
-                echo -e "${GREEN}[✅] Listening on port $PORT${NC}"
-                return 0
-            fi
-            attempts=$((attempts + 1))
-            echo -ne "${YELLOW}   Waiting for port $PORT ($attempts/10)...${NC}\r"
-            sleep 2
-        done
-        echo -e "\n${YELLOW}[⚠️] Port $PORT not listening yet${NC}"
-    else
-        echo -e "${RED}[❌] Service failed to start${NC}"
-        return 1
-    fi
-    
-    return 0
-}
+# Check if port is listening
+if ! ss -tln | grep -q ":$PORT "; then
+    echo "\$(date): Port \$PORT not listening" >> $LOG_DIR/\$PROXY_NAME-health.log
+    exit 1
+fi
 
-show_connection_details() {
-    local port=$1
-    local secret=$2
-    
-    # Get public IP
-    get_public_ip
-    
-    echo -e "\n${BLUE}══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}          🎉 MTG Proxy Installed Successfully!          ${NC}"
-    echo -e "${BLUE}══════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "${YELLOW}📊 CONNECTION DETAILS:${NC}"
-    echo ""
-    echo -e "  ${BLUE}•${NC} Server IP:   ${GREEN}$IP${NC}"
-    echo -e "  ${BLUE}•${NC} Port:        ${GREEN}$port${NC}"
-    echo -e "  ${BLUE}•${NC} Secret:      ${GREEN}$secret${NC}"
-    echo ""
-    echo -e "${YELLOW}🔗 QUICK LINKS:${NC}"
-    echo ""
-    
-    # Telegram proxy link
-    TELEGRAM_LINK="tg://proxy?server=$IP&port=$port&secret=$secret"
-    echo -e "  ${BLUE}📱 Telegram App:${NC}"
-    echo "  $TELEGRAM_LINK"
-    echo ""
-    
-    # Web link
-    WEB_LINK="https://t.me/proxy?server=$IP&port=$port&secret=$secret"
-    echo -e "  ${BLUE}🌐 Web Browser:${NC}"
-    echo "  $WEB_LINK"
-    echo ""
-    
-    # Manual config
-    echo -e "${YELLOW}⚙️ MANUAL CONFIGURATION:${NC}"
-    echo ""
-    echo "  Server: $IP"
-    echo "  Port: $port"
-    echo "  Secret: $secret"
-    echo ""
-    
-    echo -e "${YELLOW}📋 MANAGEMENT COMMANDS:${NC}"
-    echo ""
-    echo "  sudo systemctl status mtg      # Check status"
-    echo "  sudo systemctl restart mtg     # Restart proxy"
-    echo "  sudo systemctl stop mtg        # Stop proxy"
-    echo "  sudo journalctl -u mtg -f      # View logs"
-    echo "  sudo tail -f $LOG_FILE         # View log file"
-    echo ""
-    
-    echo -e "${BLUE}══════════════════════════════════════════════════════════${NC}"
-    
-    # Save to file
-    INFO_FILE="/root/mtg-connection.txt"
-    cat > "$INFO_FILE" <<EOF
-========================================
-MTG Proxy Connection Details
-========================================
-Date: $(date)
-Server IP: $IP
-Port: $port
-Secret: $secret
+# Simple connectivity test
+if ! timeout 5 curl -s "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
+    echo "\$(date): Local connectivity test failed" >> $LOG_DIR/\$PROXY_NAME-health.log
+    exit 1
+fi
 
-Quick Links:
-Telegram: $TELEGRAM_LINK
-Web: $WEB_LINK
-
-Management:
-- Check status: systemctl status mtg
-- View logs: journalctl -u mtg -f
-- Restart: systemctl restart mtg
-========================================
+echo "\$(date): Health check passed" >> $LOG_DIR/\$PROXY_NAME-health.log
+exit 0
 EOF
     
-    echo -e "${YELLOW}💾 Details saved to: $INFO_FILE${NC}"
-    echo -e "${GREEN}📋 You can copy the link above and paste it in Telegram${NC}"
+    sudo chmod +x "$health_script"
+    
+    # Create monitoring timer
+    cat <<EOF | sudo tee "/etc/systemd/system/mtpulse-$proxy_name-monitor.timer" > /dev/null
+[Unit]
+Description=Health monitoring for $proxy_name
+Requires=mtpulse-$proxy_name.service
+
+[Timer]
+OnUnitActiveSec=60s
+OnBootSec=60s
+
+[Install]
+WantedBy=timers.target
+EOF
+    
+    cat <<EOF | sudo tee "/etc/systemd/system/mtpulse-$proxy_name-monitor.service" > /dev/null
+[Unit]
+Description=Health monitor for $proxy_name
+After=mtpulse-$proxy_name.service
+
+[Service]
+Type=oneshot
+ExecStart=$health_script
+EOF
+    
+    # Enable and start
+    sudo systemctl daemon-reload
+    sudo systemctl enable "mtpulse-$proxy_name.service"
+    sudo systemctl enable "mtpulse-$proxy_name-monitor.timer"
+    sudo systemctl start "mtpulse-$proxy_name.service"
+    sudo systemctl start "mtpulse-$proxy_name-monitor.timer"
+    
+    # Add to database
+    add_proxy_to_db "$proxy_name" "$port" "$secret" "$tag"
+    
+    # Show connection info
+    local public_ip=$(curl -s --max-time 5 https://api.ipify.org || echo "Unknown IP")
+    
+    clear
+    echo ""
+    draw_line "$BOLD_GREEN" "=" 60
+    echo -e "${BOLD_GREEN}     🎉 Proxy Created Successfully!${RESET}"
+    draw_line "$BOLD_GREEN" "=" 60
+    echo ""
+    echo -e "  ${CYAN}Proxy Name:${RESET} ${WHITE}$proxy_name${RESET}"
+    echo -e "  ${CYAN}Server IP:${RESET} ${WHITE}$public_ip${RESET}"
+    echo -e "  ${CYAN}Port:${RESET} ${WHITE}$port${RESET}"
+    echo -e "  ${CYAN}Secret:${RESET} ${WHITE}$secret${RESET}"
+    [[ -n "$tag" ]] && echo -e "  ${CYAN}AD Tag:${RESET} ${MAGENTA}$tag${RESET}"
+    echo ""
+    echo -e "${BOLD_CYAN}Connection Link:${RESET}"
+    echo -e "tg://proxy?server=$public_ip&port=$port&secret=$secret"
+    echo ""
+    echo -e "${BOLD_CYAN}Alternative Link:${RESET}"
+    echo -e "https://t.me/proxy?server=$public_ip&port=$port&secret=$secret"
+    echo ""
+    draw_line "$CYAN" "-" 60
+    echo -e "${YELLOW}📊 Service Status:${RESET}"
+    sudo systemctl status "mtpulse-$proxy_name.service" --no-pager -l
+    echo ""
+    
+    echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"
+    read
 }
 
-verify_installation() {
-    echo -e "\n${YELLOW}[*] Verifying installation...${NC}"
+# --- Proxy Management ---
+manage_proxy() {
+    clear
+    echo ""
+    draw_line "$CYAN" "=" 60
+    echo -e "${BOLD_GREEN}     ⚙️ Proxy Management${RESET}"
+    draw_line "$CYAN" "=" 60
+    echo ""
     
-    local errors=0
-    local warnings=0
-    
-    # Check binary
-    if [[ -f "$BIN" ]]; then
-        echo -e "${GREEN}✅ Binary: $BIN${NC}"
-        if [[ -x "$BIN" ]]; then
-            echo -e "   Executable: ${GREEN}Yes${NC}"
-        else
-            echo -e "   Executable: ${RED}No${NC}"
-            errors=$((errors+1))
-        fi
-    else
-        echo -e "${RED}❌ Binary missing: $BIN${NC}"
-        errors=$((errors+1))
+    if ! list_proxies; then
+        echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"
+        read
+        return
     fi
     
-    # Check config
-    if [[ -f "$CONF" ]]; then
-        echo -e "${GREEN}✅ Config: $CONF${NC}"
-        if grep -q "secret = " "$CONF"; then
-            echo -e "   Has secret: ${GREEN}Yes${NC}"
-        else
-            echo -e "   Has secret: ${RED}No${NC}"
-            errors=$((errors+1))
-        fi
-    else
-        echo -e "${RED}❌ Config missing: $CONF${NC}"
-        errors=$((errors+1))
-    fi
+    echo ""
+    echo -e "  ${BOLD_CYAN}1)${RESET} ${WHITE}View Proxy Details${RESET}"
+    echo -e "  ${BOLD_CYAN}2)${RESET} ${WHITE}Restart Proxy${RESET}"
+    echo -e "  ${BOLD_CYAN}3)${RESET} ${WHITE}Stop Proxy${RESET}"
+    echo -e "  ${BOLD_CYAN}4)${RESET} ${WHITE}Delete Proxy${RESET}"
+    echo -e "  ${BOLD_CYAN}5)${RESET} ${WHITE}View Logs${RESET}"
+    echo -e "  ${BOLD_CYAN}6)${RESET} ${WHITE}View Statistics${RESET}"
+    echo -e "  ${BOLD_CYAN}0)${RESET} ${WHITE}Back${RESET}"
+    echo ""
+    draw_line "$CYAN" "-" 60
     
-    # Check service
-    if [[ -f "$SERVICE" ]]; then
-        echo -e "${GREEN}✅ Service file: $SERVICE${NC}"
-    else
-        echo -e "${RED}❌ Service file missing${NC}"
-        errors=$((errors+1))
-    fi
+    echo -e -n "👉 ${BOLD_MAGENTA}Select: ${RESET}"
+    read mgmt_choice
     
-    # Check service status
-    if systemctl is-active mtg &>/dev/null; then
-        echo -e "${GREEN}✅ Service: Active${NC}"
-    else
-        echo -e "${RED}❌ Service: Not active${NC}"
-        errors=$((errors+1))
-    fi
+    case $mgmt_choice in
+        1)
+            echo -e -n "👉 ${BOLD_MAGENTA}Proxy name: ${RESET}"
+            read proxy_name
+            show_proxy_details "$proxy_name"
+            ;;
+        2)
+            echo -e -n "👉 ${BOLD_MAGENTA}Proxy name: ${RESET}"
+            read proxy_name
+            sudo systemctl restart "mtpulse-$proxy_name.service"
+            print_success "Proxy $proxy_name restarted"
+            ;;
+        3)
+            echo -e -n "👉 ${BOLD_MAGENTA}Proxy name: ${RESET}"
+            read proxy_name
+            sudo systemctl stop "mtpulse-$proxy_name.service"
+            sudo systemctl stop "mtpulse-$proxy_name-monitor.timer"
+            print_success "Proxy $proxy_name stopped"
+            ;;
+        4)
+            echo -e -n "👉 ${BOLD_MAGENTA}Proxy name: ${RESET}"
+            read proxy_name
+            delete_proxy "$proxy_name"
+            ;;
+        5)
+            echo -e -n "👉 ${BOLD_MAGENTA}Proxy name: ${RESET}"
+            read proxy_name
+            show_proxy_logs "$proxy_name"
+            ;;
+        6)
+            echo -e -n "👉 ${BOLD_MAGENTA}Proxy name: ${RESET}"
+            read proxy_name
+            show_proxy_stats "$proxy_name"
+            ;;
+        0)
+            return
+            ;;
+        *)
+            print_error "Invalid selection"
+            ;;
+    esac
     
-    # Check port
-    if ss -tuln 2>/dev/null | grep -q ":$PORT "; then
-        echo -e "${GREEN}✅ Port $PORT: Listening${NC}"
-    else
-        echo -e "${YELLOW}⚠️ Port $PORT: Not listening${NC}"
-        warnings=$((warnings+1))
-    fi
-    
-    # Summary
-    if [[ $errors -eq 0 ]]; then
-        if [[ $warnings -eq 0 ]]; then
-            echo -e "\n${GREEN}🎉 All checks passed! Installation is successful.${NC}"
-        else
-            echo -e "\n${YELLOW}⚠️ Installation completed with $warnings warning(s)${NC}"
-        fi
-    else
-        echo -e "\n${RED}❌ Installation has $errors error(s)${NC}"
-        return 1
-    fi
-    
-    return 0
+    echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"
+    read
 }
 
-main_installation() {
-    show_banner
-    check_root
+show_proxy_details() {
+    local proxy_name="$1"
     
-    echo -e "${YELLOW}[*] Starting MTG Proxy Installation${NC}"
-    echo ""
-    
-    # Get port
-    read -p "Enter port number (default: 443): " PORT
-    PORT=${PORT:-443}
-    
-    # Validate port
-    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [[ "$PORT" -lt 1 ]] || [[ "$PORT" -gt 65535 ]]; then
-        echo -e "${RED}Error: Invalid port number. Must be 1-65535${NC}"
-        exit 1
+    # Get from database
+    local proxy_info=$(grep "^$proxy_name|" "$PROXY_DB")
+    if [ -z "$proxy_info" ]; then
+        print_error "Proxy not found"
+        return
     fi
     
-    # Check port availability
-    if ! check_port "$PORT"; then
-        echo -e "${RED}Please choose a different port or stop the service using port $PORT${NC}"
-        exit 1
-    fi
+    IFS='|' read -r name port secret tag status created_at last_check <<< "$proxy_info"
     
+    clear
     echo ""
-    echo -e "${YELLOW}[*] Installation Steps:${NC}"
-    echo "  1. Install dependencies"
-    echo "  2. Configure firewall"
-    echo "  3. Optimize network (BBR)"
-    echo "  4. Download MTG binary"
-    echo "  5. Create configuration"
-    echo "  6. Setup systemd service"
-    echo "  7. Start service"
+    draw_line "$BOLD_CYAN" "=" 60
+    echo -e "${BOLD_GREEN}     📋 Proxy Details: $name${RESET}"
+    draw_line "$BOLD_CYAN" "=" 60
     echo ""
     
-    # Step 1: Dependencies
-    echo -e "${BLUE}[1/7] Installing dependencies...${NC}"
-    install_deps
+    # Basic info
+    echo -e "  ${CYAN}📌 Basic Information:${RESET}"
+    echo -e "    Name: ${WHITE}$name${RESET}"
+    echo -e "    Port: ${WHITE}$port${RESET}"
+    echo -e "    Status: $(systemctl is-active --quiet "mtpulse-$name" && echo "${GREEN}Active${RESET}" || echo "${RED}Inactive${RESET}")"
+    echo -e "    Created: ${WHITE}$created_at${RESET}"
+    [ -n "$tag" ] && echo -e "    AD Tag: ${MAGENTA}$tag${RESET}"
     
-    # Step 2: Firewall
-    echo -e "${BLUE}[2/7] Configuring firewall...${NC}"
-    configure_firewall "$PORT"
+    echo ""
     
-    # Step 3: Network optimization
-    echo -e "${BLUE}[3/7] Optimizing network...${NC}"
-    configure_bbr
+    # Service status
+    echo -e "  ${CYAN}📊 Service Status:${RESET}"
+    sudo systemctl status "mtpulse-$name" --no-pager | head -20
     
-    # Step 4: Download binary
-    echo -e "${BLUE}[4/7] Downloading MTG...${NC}"
-    download_mtg_binary
+    echo ""
     
-    # Step 5: Configuration
-    echo -e "${BLUE}[5/7] Creating configuration...${NC}"
-    SECRET=$(create_config "$PORT")
+    # Connection info
+    echo -e "  ${CYAN}🔗 Connection Information:${RESET}"
+    local public_ip=$(curl -s --max-time 3 https://api.ipify.org || echo "Unknown")
+    echo -e "    IP: ${WHITE}$public_ip${RESET}"
+    echo -e "    Secret: ${WHITE}$secret${RESET}"
+    echo ""
+    echo -e "    ${BOLD_GREEN}Connection Link:${RESET}"
+    echo -e "    tg://proxy?server=$public_ip&port=$port&secret=$secret"
     
-    # Step 6: Service
-    echo -e "${BLUE}[6/7] Creating service...${NC}"
-    create_systemd_service
+    echo ""
+    draw_line "$CYAN" "-" 60
+}
+
+delete_proxy() {
+    local proxy_name="$1"
     
-    # Step 7: Start
-    echo -e "${BLUE}[7/7] Starting service...${NC}"
-    if start_mtg_service; then
-        echo ""
-        show_connection_details "$PORT" "$SECRET"
-        echo ""
+    echo -e "${RED}⚠️  Are you sure you want to delete proxy '$proxy_name'? (y/N): ${RESET}"
+    read confirm
+    
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        print_info "Deleting proxy $proxy_name..."
         
-        # Final verification
-        verify_installation
+        # Stop services
+        sudo systemctl stop "mtpulse-$proxy_name.service" 2>/dev/null || true
+        sudo systemctl stop "mtpulse-$proxy_name-monitor.timer" 2>/dev/null || true
+        sudo systemctl disable "mtpulse-$proxy_name.service" 2>/dev/null || true
+        sudo systemctl disable "mtpulse-$proxy_name-monitor.timer" 2>/dev/null || true
+        
+        # Remove service files
+        sudo rm -f "/etc/systemd/system/mtpulse-$proxy_name.service"
+        sudo rm -f "/etc/systemd/system/mtpulse-$proxy_name-monitor.timer"
+        sudo rm -f "/etc/systemd/system/mtpulse-$proxy_name-monitor.service"
+        
+        # Remove config directory
+        sudo rm -rf "$CONFIG_DIR/proxies/$proxy_name"
+        
+        # Remove from database
+        remove_proxy_from_db "$proxy_name"
+        
+        # Reload systemd
+        sudo systemctl daemon-reload
+        
+        print_success "Proxy $proxy_name deleted successfully"
     else
-        echo -e "${RED}❌ Failed to start service${NC}"
-        echo -e "${YELLOW}Troubleshooting steps:${NC}"
-        echo "1. Check logs: sudo journalctl -u mtg"
-        echo "2. Test manually: sudo $BIN run $CONF"
-        echo "3. Check port: sudo netstat -tulpn | grep :$PORT"
-        exit 1
+        print_info "Deletion cancelled"
     fi
 }
 
-### ===== Main =====
-if [[ "$1" == "help" || "$1" == "-h" ]]; then
-    echo "MTG Proxy Installer"
-    echo "Usage:"
-    echo "  sudo bash $0          # Install MTG Proxy"
-    echo "  sudo bash $0 status   # Check installation status"
-    echo "  sudo bash $0 repair   # Repair installation"
-    echo "  sudo bash $0 remove   # Remove MTG Proxy"
-    exit 0
-fi
-
-if [[ "$1" == "status" ]]; then
-    echo -e "${YELLOW}[*] Checking MTG Proxy status...${NC}"
-    systemctl status mtg --no-pager
+show_proxy_logs() {
+    local proxy_name="$1"
+    
+    clear
     echo ""
-    echo -e "${YELLOW}[*] Listening ports:${NC}"
-    ss -tuln | grep ":${PORT:-443} " || echo "Port ${PORT:-443} not listening"
-    exit 0
+    draw_line "$CYAN" "=" 60
+    echo -e "${BOLD_GREEN}     📝 Logs for $proxy_name${RESET}"
+    draw_line "$CYAN" "=" 60
+    echo ""
+    
+    echo -e "${YELLOW}--- Service Logs (Last 50 lines) ---${RESET}"
+    sudo journalctl -u "mtpulse-$proxy_name" -n 50 --no-pager
+    
+    echo ""
+    echo -e "${YELLOW}--- Error Logs ---${RESET}"
+    sudo tail -n 50 "$LOG_DIR/$proxy_name-error.log" 2>/dev/null || \
+        echo "No error logs found"
+    
+    echo ""
+    echo -e "${YELLOW}--- Health Check Logs ---${RESET}"
+    sudo tail -n 50 "$LOG_DIR/$proxy_name-health.log" 2>/dev/null || \
+        echo "No health logs found"
+}
+
+show_proxy_stats() {
+    local proxy_name="$1"
+    
+    # Check if service exists
+    if ! systemctl is-enabled "mtpulse-$proxy_name" 2>/dev/null; then
+        print_error "Proxy $proxy_name not found"
+        return
+    fi
+    
+    clear
+    echo ""
+    draw_line "$MAGENTA" "=" 60
+    echo -e "${BOLD_GREEN}     📊 Statistics for $proxy_name${RESET}"
+    draw_line "$MAGENTA" "=" 60
+    echo ""
+    
+    # Get PID
+    local pid=$(systemctl show "mtpulse-$proxy_name" --property=MainPID --value 2>/dev/null)
+    
+    if [[ -z "$pid" || "$pid" -eq 0 ]]; then
+        print_error "Proxy is not running"
+        return
+    fi
+    
+    # Memory usage
+    if [ -f "/proc/$pid/status" ]; then
+        local vm_size=$(grep VmSize "/proc/$pid/status" | awk '{printf "%.1f MB", $2/1024}')
+        local vm_rss=$(grep VmRSS "/proc/$pid/status" | awk '{printf "%.1f MB", $2/1024}')
+        echo -e "${CYAN}Memory Usage:${RESET}"
+        echo -e "  Virtual Memory: ${WHITE}$vm_size${RESET}"
+        echo -e "  Resident Memory: ${WHITE}$vm_rss${RESET}"
+    fi
+    
+    # CPU usage
+    echo ""
+    echo -e "${CYAN}CPU Usage:${RESET}"
+    ps -p "$pid" -o %cpu,etime,time --no-headers | awk '{print "  CPU: "$1"% | Uptime: "$2" | CPU Time: "$3}'
+    
+    # Connections
+    echo ""
+    echo -e "${CYAN}Network Connections:${RESET}"
+    local connections=$(sudo ss -tnp | grep "pid=$pid" | wc -l)
+    echo -e "  Active Connections: ${WHITE}$connections${RESET}"
+    
+    # Service uptime
+    echo ""
+    echo -e "${CYAN}Service Information:${RESET}"
+    systemctl show "mtpulse-$proxy_name" --property=ActiveEnterTimestamp --value 2>/dev/null | \
+        awk '{print "  Started: "$1" "$2" "$3}'
+    
+    # Disk usage
+    echo ""
+    echo -e "${CYAN}Disk Usage:${RESET}"
+    sudo du -sh "$CONFIG_DIR/proxies/$proxy_name" 2>/dev/null || echo "  Config: Not found"
+}
+
+# --- Monitor All Proxies ---
+monitor_all_proxies() {
+    clear
+    echo ""
+    draw_line "$YELLOW" "=" 60
+    echo -e "${BOLD_GREEN}     📡 Monitoring Proxy Status${RESET}"
+    draw_line "$YELLOW" "=" 60
+    echo ""
+    
+    if [ ! -s "$PROXY_DB" ]; then
+        print_warning "No proxies to monitor"
+        return
+    fi
+    
+    echo -e "${CYAN}┌──────────────────────────────────────────────────────────────┐${RESET}"
+    echo -e "${CYAN}│                     Live Status                              │${RESET}"
+    echo -e "${CYAN}├──────────┬──────┬──────────┬────────────┬───────────────────┤${RESET}"
+    echo -e "${CYAN}│   Name   │ Port │  Status  │   Memory   │      Uptime       │${RESET}"
+    echo -e "${CYAN}├──────────┼──────┼──────────┼────────────┼───────────────────┤${RESET}"
+    
+    while IFS='|' read -r name port secret tag status created_at last_check; do
+        [[ "$name" =~ ^# ]] && continue
+        
+        # Get PID
+        local pid=$(systemctl show "mtpulse-$name" --property=MainPID --value 2>/dev/null)
+        
+        if [[ -n "$pid" && "$pid" -ne 0 ]]; then
+            # Service is running
+            local mem_usage=""
+            local uptime=""
+            
+            # Get memory usage
+            if [ -f "/proc/$pid/status" ]; then
+                mem_usage=$(grep VmRSS "/proc/$pid/status" | awk '{printf "%.1f MB", $2/1024}')
+            fi
+            
+            # Get uptime
+            uptime=$(systemctl show "mtpulse-$name" --property=ActiveEnterTimestamp --value 2>/dev/null | \
+                    awk '{print $2, $3}' || echo "Unknown")
+            
+            printf "${WHITE}│ ${GREEN}%-8s${WHITE} │ ${GREEN}%-4s${WHITE} │ ${GREEN}%-8s${WHITE} │ ${CYAN}%-10s${WHITE} │ ${YELLOW}%-17s${WHITE} │\n" \
+                "$name" "$port" "Active" "$mem_usage" "$uptime"
+        else
+            # Service is not running
+            printf "${WHITE}│ ${RED}%-8s${WHITE} │ ${RED}%-4s${WHITE} │ ${RED}%-8s${WHITE} │ ${RED}%-10s${WHITE} │ ${RED}%-17s${WHITE} │\n" \
+                "$name" "$port" "Stopped" "---" "---"
+        fi
+    done < "$PROXY_DB"
+    
+    echo -e "${CYAN}└──────────┴──────┴──────────┴────────────┴───────────────────┘${RESET}"
+    
+    # Show system load
+    echo ""
+    echo -e "${CYAN}📊 System Status:${RESET}"
+    echo -e "  System Load: $(uptime | awk -F'load average:' '{print $2}')"
+    echo -e "  Free Memory: $(free -m | awk 'NR==2{printf "%.1f%%", $4*100/$2}')"
+    echo -e "  Disk Space: $(df -h / | awk 'NR==2{print $4 " free"}')"
+    
+    echo ""
+    echo -e "${BOLD_MAGENTA}Auto-refreshing every 10 seconds, press Ctrl+C to stop${RESET}"
+    
+    # Auto-refresh every 10 seconds
+    for i in {1..6}; do
+        echo -n "."
+        sleep 10
+    done
+    
+    monitor_all_proxies  # Recursive refresh
+}
+
+# --- Bulk Operations ---
+bulk_operations() {
+    clear
+    echo ""
+    draw_line "$MAGENTA" "=" 60
+    echo -e "${BOLD_GREEN}     🔄 Bulk Operations${RESET}"
+    draw_line "$MAGENTA" "=" 60
+    echo ""
+    
+    echo -e "  ${BOLD_CYAN}1)${RESET} ${WHITE}Restart All Proxies${RESET}"
+    echo -e "  ${BOLD_CYAN}2)${RESET} ${WHITE}Stop All Proxies${RESET}"
+    echo -e "  ${BOLD_CYAN}3)${RESET} ${WHITE}Backup All Configs${RESET}"
+    echo -e "  ${BOLD_CYAN}4)${RESET} ${WHITE}Update All Proxies${RESET}"
+    echo -e "  ${BOLD_CYAN}0)${RESET} ${WHITE}Back${RESET}"
+    echo ""
+    
+    echo -e -n "👉 ${BOLD_MAGENTA}Select: ${RESET}"
+    read bulk_choice
+    
+    case $bulk_choice in
+        1)
+            restart_all_proxies
+            ;;
+        2)
+            stop_all_proxies
+            ;;
+        3)
+            backup_all_proxies
+            ;;
+        4)
+            update_all_proxies
+            ;;
+        0)
+            return
+            ;;
+        *)
+            print_error "Invalid selection"
+            ;;
+    esac
+}
+
+restart_all_proxies() {
+    print_info "Restarting all proxies..."
+    
+    while IFS='|' read -r name port secret tag status created_at last_check; do
+        [[ "$name" =~ ^# ]] && continue
+        
+        sudo systemctl restart "mtpulse-$name" 2>/dev/null && \
+            print_success "Proxy $name restarted" || \
+            print_error "Error restarting $name"
+    done < "$PROXY_DB"
+}
+
+stop_all_proxies() {
+    print_info "Stopping all proxies..."
+    
+    while IFS='|' read -r name port secret tag status created_at last_check; do
+        [[ "$name" =~ ^# ]] && continue
+        
+        sudo systemctl stop "mtpulse-$name" 2>/dev/null && \
+            print_success "Proxy $name stopped" || \
+            print_error "Error stopping $name"
+    done < "$PROXY_DB"
+}
+
+# --- Backup and Restore ---
+backup_all_proxies() {
+    local backup_dir="$HOME/mtpulse-backup-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup_dir"
+    
+    print_info "Creating backup in $backup_dir..."
+    
+    # Backup database
+    sudo cp "$PROXY_DB" "$backup_dir/proxies.db"
+    
+    # Backup service files
+    while IFS='|' read -r name port secret tag status created_at last_check; do
+        [[ "$name" =~ ^# ]] && continue
+        
+        if [ -f "/etc/systemd/system/mtpulse-$name.service" ]; then
+            sudo cp "/etc/systemd/system/mtpulse-$name.service" "$backup_dir/"
+        fi
+    done < "$PROXY_DB"
+    
+    # Backup configs
+    sudo cp -r "$CONFIG_DIR" "$backup_dir/config"
+    
+    # Create restore script
+    cat > "$backup_dir/restore.sh" <<'EOF'
+#!/bin/bash
+# Restore MTPulse Proxies
+
+set -e
+
+echo "Starting restore process..."
+echo ""
+
+# Check root
+if [ "$EUID" -ne 0 ]; then 
+    echo "Please run as root"
+    exit 1
 fi
 
-if [[ "$1" == "repair" ]]; then
-    echo -e "${YELLOW}[*] Repairing MTG installation...${NC}"
-    systemctl stop mtg 2>/dev/null || true
-    systemctl daemon-reload
-    systemctl reset-failed mtg 2>/dev/null || true
-    systemctl start mtg
-    systemctl status mtg --no-pager | head -20
-    exit 0
+# Restore configs
+if [ -d "config" ]; then
+    cp -r config/* /etc/mtpulse/
+    echo "Configs restored"
 fi
 
-if [[ "$1" == "remove" ]]; then
-    echo -e "${YELLOW}[*] Removing MTG Proxy...${NC}"
-    systemctl stop mtg 2>/dev/null || true
-    systemctl disable mtg 2>/dev/null || true
-    rm -f "$SERVICE" "$BIN"
-    rm -rf "$CONF_DIR"
-    systemctl daemon-reload
-    echo -e "${GREEN}[+] MTG Proxy removed${NC}"
-    exit 0
+# Restore database
+if [ -f "proxies.db" ]; then
+    cp proxies.db /etc/mtpulse/proxies.db
+    echo "Database restored"
 fi
 
-# Run main installation
-main_installation
+# Restore services
+for service_file in mtpulse-*.service; do
+    if [ -f "$service_file" ]; then
+        cp "$service_file" /etc/systemd/system/
+        systemctl daemon-reload
+        
+        proxy_name=${service_file#mtpulse-}
+        proxy_name=${proxy_name%.service}
+        systemctl enable "mtpulse-$proxy_name" 2>/dev/null || true
+        
+        echo "Service $proxy_name restored"
+    fi
+done
+
+echo ""
+echo "Restore completed!"
+echo "Run 'systemctl start mtpulse-<name>' to start each proxy"
+EOF
+    
+    chmod +x "$backup_dir/restore.sh"
+    
+    # Create archive
+    tar -czf "$backup_dir.tar.gz" -C "$backup_dir" .
+    rm -rf "$backup_dir"
+    
+    print_success "Backup completed: $backup_dir.tar.gz"
+    echo -e "${YELLOW}To restore, transfer file to new server and run restore.sh${RESET}"
+    echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"
+    read
+}
+
+update_all_proxies() {
+    print_info "Updating all proxies..."
+    
+    # Update config files
+    sudo curl -s --max-time 30 https://core.telegram.org/getProxySecret -o "$CONFIG_DIR/proxy-secret"
+    sudo curl -s --max-time 30 https://core.telegram.org/getProxyConfig" -o "$CONFIG_DIR/proxy-multi.conf"
+    
+    # Restart all proxies
+    restart_all_proxies
+    
+    print_success "All proxies updated"
+}
+
+# --- System Optimization ---
+optimize_system() {
+    clear
+    echo ""
+    draw_line "$YELLOW" "=" 60
+    echo -e "${BOLD_GREEN}     ⚡ System Optimization${RESET}"
+    draw_line "$YELLOW" "=" 60
+    echo ""
+    
+    echo -e "  ${BOLD_CYAN}1)${RESET} ${WHITE}Network Settings${RESET}"
+    echo -e "  ${BOLD_CYAN}2)${RESET} ${WHITE}System Settings${RESET}"
+    echo -e "  ${BOLD_CYAN}3)${RESET} ${WHITE}Firewall Configuration${RESET}"
+    echo -e "  ${BOLD_CYAN}4)${RESET} ${WHITE}Kernel Optimization${RESET}"
+    echo -e "  ${BOLD_CYAN}0)${RESET} ${WHITE}Back${RESET}"
+    echo ""
+    
+    echo -e -n "👉 ${BOLD_MAGENTA}Select: ${RESET}"
+    read opt_choice
+    
+    case $opt_choice in
+        1)
+            optimize_network
+            ;;
+        2)
+            optimize_system_settings
+            ;;
+        3)
+            configure_firewall
+            ;;
+        4)
+            optimize_kernel
+            ;;
+        0)
+            return
+            ;;
+        *)
+            print_error "Invalid selection"
+            ;;
+    esac
+}
+
+optimize_network() {
+    print_info "Optimizing network settings..."
+    
+    # Create network optimization
+    cat <<EOF | sudo tee /etc/sysctl.d/98-mtpulse-network.conf > /dev/null
+# Network optimization for MTProxy
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.core.optmem_max = 134217728
+net.core.netdev_max_backlog = 100000
+net.core.somaxconn = 100000
+net.core.default_qdisc = fq
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 87380 134217728
+net.ipv4.tcp_mtu_probing = 2
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_max_syn_backlog = 100000
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_ecn = 2
+net.ipv4.tcp_fack = 1
+EOF
+    
+    sudo sysctl -p /etc/sysctl.d/98-mtpulse-network.conf
+    print_success "Network settings optimized"
+}
+
+optimize_system_settings() {
+    print_info "Optimizing system settings..."
+    
+    # Increase file limits
+    cat <<EOF | sudo tee /etc/security/limits.d/99-mtpulse.conf > /dev/null
+# MTPulse file limits
+* soft nofile 1048576
+* hard nofile 1048576
+* soft nproc unlimited
+* hard nproc unlimited
+* soft memlock unlimited
+* hard memlock unlimited
+EOF
+    
+    # Configure systemd for better performance
+    cat <<EOF | sudo tee /etc/systemd/system.conf.d/99-mtpulse.conf > /dev/null
+[Manager]
+DefaultLimitNOFILE=1048576
+DefaultLimitNPROC=unlimited
+DefaultLimitMEMLOCK=infinity
+EOF
+    
+    sudo systemctl daemon-reexec
+    print_success "System settings optimized"
+}
+
+configure_firewall() {
+    print_info "Configuring firewall..."
+    
+    # Get all proxy ports
+    local ports=()
+    while IFS='|' read -r name port secret tag status created_at last_check; do
+        [[ "$name" =~ ^# ]] && continue
+        ports+=("$port")
+    done < "$PROXY_DB"
+    
+    # Configure UFW if available
+    if command -v ufw &>/dev/null; then
+        for port in "${ports[@]}"; do
+            sudo ufw allow "$port/tcp"
+        done
+        sudo ufw reload
+        print_success "Firewall configured for ports: ${ports[*]}"
+    else
+        print_warning "UFW not found. Please configure firewall manually"
+    fi
+}
+
+optimize_kernel() {
+    print_info "Applying kernel optimizations..."
+    
+    cat <<EOF | sudo tee /etc/sysctl.d/97-mtpulse-kernel.conf > /dev/null
+# Kernel optimizations for MTProxy
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
+vm.dirty_expire_centisecs = 3000
+vm.dirty_writeback_centisecs = 500
+kernel.pid_max = 4194304
+kernel.threads-max = 2097152
+kernel.sched_autogroup_enabled = 1
+fs.file-max = 2097152
+EOF
+    
+    sudo sysctl -p /etc/sysctl.d/97-mtpulse-kernel.conf
+    print_success "Kernel optimizations applied"
+}
+
+# --- View Logs ---
+view_logs() {
+    clear
+    echo ""
+    draw_line "$MAGENTA" "=" 60
+    echo -e "${BOLD_GREEN}     📝 View Logs${RESET}"
+    draw_line "$MAGENTA" "=" 60
+    echo ""
+    
+    echo -e "  ${BOLD_CYAN}1)${RESET} ${WHITE}Service Logs${RESET}"
+    echo -e "  ${BOLD_CYAN}2)${RESET} ${WHITE}Error Logs${RESET}"
+    echo -e "  ${BOLD_CYAN}3)${RESET} ${WHITE}Health Logs${RESET}"
+    echo -e "  ${BOLD_CYAN}4)${RESET} ${WHITE}System Logs${RESET}"
+    echo -e "  ${BOLD_CYAN}0)${RESET} ${WHITE}Back${RESET}"
+    echo ""
+    
+    echo -e -n "👉 ${BOLD_MAGENTA}Select: ${RESET}"
+    read log_choice
+    
+    case $log_choice in
+        1)
+            echo -e -n "👉 ${BOLD_MAGENTA}Proxy name: ${RESET}"
+            read proxy_name
+            sudo journalctl -u "mtpulse-$proxy_name" -n 50 --no-pager
+            ;;
+        2)
+            echo -e -n "👉 ${BOLD_MAGENTA}Proxy name: ${RESET}"
+            read proxy_name
+            sudo tail -n 50 "$LOG_DIR/$proxy_name-error.log" 2>/dev/null || \
+                echo "No error logs found"
+            ;;
+        3)
+            echo -e -n "👉 ${BOLD_MAGENTA}Proxy name: ${RESET}"
+            read proxy_name
+            sudo tail -n 50 "$LOG_DIR/$proxy_name-health.log" 2>/dev/null || \
+                echo "No health logs found"
+            ;;
+        4)
+            sudo dmesg | tail -n 50
+            ;;
+        0)
+            return
+            ;;
+        *)
+            print_error "Invalid selection"
+            ;;
+    esac
+    
+    echo ""
+    echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"
+    read
+}
+
+# --- Main Menu ---
+main_menu() {
+    clear
+    echo -e "${BOLD_CYAN}"
+    echo "███╗   ███╗████████╗██████╗ ██████╗ ██╗   ██╗███████╗███████╗"
+    echo "████╗ ████║╚══██╔══╝██╔══██╗██╔══██╗██║   ██║██╔════╝██╔════╝"
+    echo "██╔████╔██║   ██║   ██████╔╝██████╔╝██║   ██║███████╗█████╗  "
+    echo "██║╚██╔╝██║   ██║   ██╔═══╝ ██╔═══╝ ██║   ██║╚════██║██╔══╝  "
+    echo "██║ ╚═╝ ██║   ██║   ██║     ██║     ╚██████╔╝███████║███████╗"
+    echo "╚═╝     ╚═╝   ╚═╝   ╚═╝     ╚═╝      ╚═════╝ ╚══════╝╚══════╝"
+    echo -e "${RESET}"
+    draw_line "$CYAN" "=" 60
+    echo -e "${BOLD_YELLOW}     Professional MTProto Proxy Manager with High Stability${RESET}"
+    echo -e "${BOLD_YELLOW}     Developer: ErfanXRay - @Erfan_XRay${RESET}"
+    draw_line "$CYAN" "=" 60
+    echo ""
+    
+    # Show quick stats
+    if [ -f "$PROXY_DB" ]; then
+        local total_proxies=$(grep -v '^#' "$PROXY_DB" | wc -l)
+        local active_proxies=0
+        
+        while IFS='|' read -r name port secret tag status created_at last_check; do
+            [[ "$name" =~ ^# ]] && continue
+            if systemctl is-active --quiet "mtpulse-$name"; then
+                ((active_proxies++))
+            fi
+        done < "$PROXY_DB"
+        
+        echo -e "${CYAN}📊 Quick Stats:${RESET}"
+        echo -e "  Total Proxies: ${WHITE}$total_proxies${RESET}"
+        echo -e "  Active Proxies: ${GREEN}$active_proxies${RESET}"
+        echo ""
+    fi
+    
+    # Menu options
+    echo -e "  ${BOLD_CYAN}1)${RESET} ${WHITE}Install/Update MTProxy${RESET}"
+    echo -e "  ${BOLD_CYAN}2)${RESET} ${WHITE}Create New Proxy${RESET}"
+    echo -e "  ${BOLD_CYAN}3)${RESET} ${WHITE}List Proxies${RESET}"
+    echo -e "  ${BOLD_CYAN}4)${RESET} ${WHITE}Manage Proxy${RESET}"
+    echo -e "  ${BOLD_CYAN}5)${RESET} ${WHITE}Monitor Status${RESET}"
+    echo -e "  ${BOLD_CYAN}6)${RESET} ${WHITE}Bulk Operations${RESET}"
+    echo -e "  ${BOLD_CYAN}7)${RESET} ${WHITE}Backup / Restore${RESET}"
+    echo -e "  ${BOLD_CYAN}8)${RESET} ${WHITE}System Optimization${RESET}"
+    echo -e "  ${BOLD_CYAN}9)${RESET} ${WHITE}View Logs${RESET}"
+    echo -e "  ${BOLD_CYAN}0)${RESET} ${WHITE}Exit${RESET}"
+    echo ""
+    draw_line "$CYAN" "-" 60
+    
+    echo -e -n "👉 ${BOLD_MAGENTA}Select: ${RESET}"
+}
+
+# --- Main Program ---
+main() {
+    # Check OS
+    if [ ! -f /etc/os-release ]; then
+        print_error "Cannot detect operating system"
+        exit 1
+    fi
+    
+    source /etc/os-release
+    if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
+        print_error "This script only supports Ubuntu and Debian"
+        exit 1
+    fi
+    
+    # Check root
+    if [ "$EUID" -ne 0 ]; then 
+        print_error "Please run as root: sudo bash $0"
+        exit 1
+    fi
+    
+    # Initialize
+    init_database
+    
+    # Main loop
+    while true; do
+        main_menu
+        read choice
+        
+        case $choice in
+            1) install_mtproxy_enhanced ;;
+            2) create_proxy ;;
+            3) list_proxies; echo -e "${BOLD_MAGENTA}Press Enter to continue...${RESET}"; read ;;
+            4) manage_proxy ;;
+            5) monitor_all_proxies ;;
+            6) bulk_operations ;;
+            7) backup_all_proxies ;;
+            8) optimize_system ;;
+            9) view_logs ;;
+            0) 
+                echo -e "${GREEN}Exiting...${RESET}"
+                exit 0
+                ;;
+            *) 
+                print_error "Invalid selection"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# Start the script
+main
